@@ -1,7 +1,7 @@
 import { useState } from "react";
 import View from "./pages/View";
 import Create from "./pages/Create";
-import Leaves from "./pages/leaves";
+import Leaves from "./pages/Leaves";
 import WFH from "./pages/WFH";
 
 function App() {
