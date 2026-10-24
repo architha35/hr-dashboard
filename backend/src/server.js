@@ -10,7 +10,10 @@ const app = express();
 app.use(express.json());
 
 app.use(cors({
-  origin: "http://localhost:5173",
+    origin: [
+        "http://localhost:5173",
+        "https://hr-dashboard-2-65et.onrender.com"
+    ]
 }));
 
 app.get("/api/employees", async (req, res) => {
