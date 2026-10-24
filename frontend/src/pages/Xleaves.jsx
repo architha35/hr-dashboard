@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 
+const BASE_URL = "https://hr-dashboard-5.onrender.com/api"
 
 const Leaves = () => {
     const [leaves, setLeaves] = useState([]);
@@ -11,10 +12,12 @@ const Leaves = () => {
 
 
 // add leave
+
     const addLeave = async (e) => {
         e.preventDefault();
         console.log(e)
-        const resp = await fetch("https://hr-dashboard-1-i7m5.onrender.com/api/create/leaves", {
+        const url = BASE_URL + "/create/leaves"
+        const resp = await fetch(url, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
@@ -49,9 +52,8 @@ const Leaves = () => {
 
 //get leaves
     const getLeaves = async () => {
-        const response = await fetch(
-    "https://hr-dashboard-5.onrender.com/api/leaves"
-);
+        const url = BASE_URL + "/leaves"
+        const response = await fetch(url);
         const data = await response.json();
         setLeaves(data);
     };

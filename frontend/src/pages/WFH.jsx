@@ -1,5 +1,8 @@
 import { useState, useEffect } from "react";
 
+const BASE_URL = "https://hr-dashboard-5.onrender.com/api"
+
+
 const WFH = () => {
     const [wfh, setwfh] = useState([]);
     const [search, setSearch] = useState("");
@@ -11,7 +14,9 @@ const WFH = () => {
     const addWfh = async (e) => {
         e.preventDefault();
 
-        const resp = await fetch("https://hr-dashboard-1-i7m5.onrender.com/api/create/wfh", {
+         const url = BASE_URL + "/create/wfh"
+
+        const resp = await fetch(url, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
@@ -34,8 +39,9 @@ const WFH = () => {
 
     // get WFH
     const getwfh = async () => {
+        const url = BASE_URL + "/wfh"
         const response = await fetch(
-    "https://hr-dashboard-1-i7m5.onrender.com/api/wfh"
+    url
 );
         const data = await response.json();
         setwfh(data);
