@@ -34,7 +34,9 @@ const WFH = () => {
 
     // get WFH
     const getwfh = async () => {
-        const response = await fetch("/api/wfh");
+        const response = await fetch(
+    "https://hr-dashboard-1-i7m5.onrender.com/api/wfh"
+);
         const data = await response.json();
         setwfh(data);
     };

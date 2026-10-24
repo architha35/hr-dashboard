@@ -49,7 +49,9 @@ const leaves = () => {
 
 //get leaves
     const getLeaves = async () => {
-        const response = await fetch("/api/leaves");
+        const response = await fetch(
+    "https://hr-dashboard-1-i7m5.onrender.com/api/leaves"
+);
         const data = await response.json();
         setLeaves(data);
     };
