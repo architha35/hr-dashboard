@@ -7,7 +7,7 @@ const Create = () => {
     const addEmployee = async (e) => {
         e.preventDefault();
 
-        await fetch("/api/create/employee", {
+        await fetch("https://hr-dashboard-1-i7m5.onrender.com/api/create/employee", {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",

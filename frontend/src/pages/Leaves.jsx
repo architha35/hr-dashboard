@@ -14,7 +14,7 @@ const leaves = () => {
     const addLeave = async (e) => {
         e.preventDefault();
         console.log(e)
-        const resp = await fetch("/api/create/leaves", {
+        const resp = await fetch("https://hr-dashboard-1-i7m5.onrender.com/api/create/leaves", {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",

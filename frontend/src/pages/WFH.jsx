@@ -11,7 +11,7 @@ const WFH = () => {
     const addWfh = async (e) => {
         e.preventDefault();
 
-        const resp = await fetch("/api/create/wfh", {
+        const resp = await fetch("https://hr-dashboard-1-i7m5.onrender.com/api/create/wfh", {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",

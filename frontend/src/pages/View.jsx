@@ -4,7 +4,7 @@ const View = () => {
     const [employees, setEmployees] = useState([]);
 
     const getEmployees = async () => {
-        const response = await fetch("/api/employees");
+        const response = await fetch("https://hr-dashboard-1-i7m5.onrender.com/api/employees");
         const data = await response.json();
         console.log(data);
         setEmployees(data);
