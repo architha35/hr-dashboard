@@ -16,6 +16,11 @@ app.use(cors({
     ]
 }));
 
+app.get("/api/test", async (req,res ) => {
+  return res.send("working!");
+}
+);
+
 app.get("/api/employees", async (req, res) => {
     const result = await db_fns.getAllEmployees();
     console.log("Result. : ", result);
