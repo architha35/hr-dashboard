@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 
 
-const leaves = () => {
+const Leaves = () => {
     const [leaves, setLeaves] = useState([]);
     const [search, setSearch] = useState("");
     const [employee, setEmployee] = useState("");
@@ -169,4 +169,4 @@ const leaves = () => {
     );
 };
 
-export default leaves;
+export default Leaves;
