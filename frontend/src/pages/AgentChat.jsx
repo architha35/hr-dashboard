@@ -464,7 +464,7 @@ const AgentChat = () => {
                         type="text"
                         value={inputValue}
                         onChange={(e) => setInputValue(e.target.value)}
-                        placeholder="Ask a question or request an action (e.g. 'Create leaves for Rohit from 3rd to 5th Nov')..."
+                        placeholder="Ask a question or request an action"
                         disabled={isLoading}
                         className="flex-1 rounded-xl border border-gray-300 py-3 px-4 text-sm outline-none transition focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100 disabled:opacity-50"
                     />
