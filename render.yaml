@@ -12,6 +12,10 @@ services:
         value: production
       - key: FRONTEND_URL
         value: https://hr-dashboard-frontend.onrender.com
+      - key: DATABASE_URL
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
 
   - type: static
     name: hr-dashboard-frontend
