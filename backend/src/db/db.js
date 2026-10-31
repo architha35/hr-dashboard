@@ -5,4 +5,8 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+pool.on("error", (err) => {
+  console.error("PostgreSQL pool idle client error:", err.message);
+});
+
 module.exports = pool;
