@@ -12,7 +12,11 @@ const GEMINI_REQUEST_TIMEOUT_MS = 45000;
 
 let genAI = null;
 if (GEMINI_API_KEY) {
-    genAI = new GoogleGenAI({ apiKey: GEMINI_API_KEY, httpOptions: { timeout: GEMINI_REQUEST_TIMEOUT_MS } });
+    genAI = new GoogleGenAI({
+        apiKey: GEMINI_API_KEY,
+        httpOptions: { timeout: GEMINI_REQUEST_TIMEOUT_MS },
+        retry_config: { strategy: "none" },
+    });
 } else {
     console.warn("[Agent] GEMINI_API_KEY not set — using rule-based fallback.");
 }
