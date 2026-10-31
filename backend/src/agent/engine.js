@@ -8,10 +8,11 @@ const { db_fns } = require("../db");
 
 const GEMINI_API_KEY = (process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY || "").replace(/[" ]/g, "");
 const GEMINI_MODEL = "gemini-3-flash-preview";
+const GEMINI_REQUEST_TIMEOUT_MS = 45000;
 
 let genAI = null;
 if (GEMINI_API_KEY) {
-    genAI = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+    genAI = new GoogleGenAI({ apiKey: GEMINI_API_KEY, httpOptions: { timeout: GEMINI_REQUEST_TIMEOUT_MS } });
 } else {
     console.warn("[Agent] GEMINI_API_KEY not set — using rule-based fallback.");
 }
@@ -827,6 +828,19 @@ const getAssistantTextFromResponse = (response) => {
     return text;
 };
 
+const withTimeout = async (promise, ms, label) => {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+        if (typeof timer.unref === "function") timer.unref();
+    });
+    try {
+        return await Promise.race([promise, timeout]);
+    } finally {
+        clearTimeout(timer);
+    }
+};
+
 const runAgentTurn = async (session, userMessage) => {
     const systemInstruction = buildSystemPrompt(session.context);
     const toolDeclarations = TOOL_SCHEMAS.map(t => ({
@@ -855,7 +869,7 @@ const runAgentTurn = async (session, userMessage) => {
                 history: historyForLLM
             });
 
-            let response = await chat.sendMessage({ message: userMessage });
+            let response = await withTimeout(chat.sendMessage({ message: userMessage }), GEMINI_REQUEST_TIMEOUT_MS, "Gemini response");
             if (!response?.candidates?.[0]) continue;
 
             // Agentic loop: keep feeding tool results back to the LLM until it
@@ -905,7 +919,7 @@ const runAgentTurn = async (session, userMessage) => {
                     return { functionResponse: { name: fc.name, response: { error: { message: outcome.error.message } } } };
                 });
 
-                response = await chat.sendMessage({ message: { parts: functionResponseParts } });
+                response = await withTimeout(chat.sendMessage({ message: { parts: functionResponseParts } }), GEMINI_REQUEST_TIMEOUT_MS, "Gemini function response");
             }
 
             const finalText = getAssistantTextFromResponse(response);
