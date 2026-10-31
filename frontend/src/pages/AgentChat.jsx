@@ -190,7 +190,7 @@ const AgentChat = () => {
                                 Connected to PostgreSQL
                             </span>
                         </h2>
-                        <p className="text-xs text-gray-500">Autonomous tool execution, parameter validation & audit logging</p>
+    
                     </div>
                 </div>
 
