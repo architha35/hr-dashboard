@@ -51,6 +51,7 @@ const getSession = (sessionId = "default") => {
                 lastResults: null,
                 lastResultType: null,
                 employeeGroup: null,
+                employeeDetails: null,
             },
             pendingProposal: null,
             lastActivity: now,
@@ -92,6 +93,41 @@ const parseTimeframe = (text) => {
         return { label: `last ${count} months`, startDate: formatDate(new Date(Date.UTC(Y, M - count, 1))), endDate: formatDate(new Date(Date.UTC(Y, M + 1, 0))) };
     }
     if (/this\s+year/i.test(text)) return { label: "this year", startDate: `${Y}-01-01`, endDate: `${Y}-12-31` };
+    if (/last\s+year/i.test(text)) return { label: "last year", startDate: `${Y - 1}-01-01`, endDate: `${Y - 1}-12-31` };
+    if (/today/i.test(text)) {
+        const date = formatDate(today);
+        return { label: "today", date, startDate: date, endDate: date };
+    }
+    if (/yesterday/i.test(text)) {
+        const date = new Date(today);
+        date.setUTCDate(date.getUTCDate() - 1);
+        const value = formatDate(date);
+        return { label: "yesterday", date: value, startDate: value, endDate: value };
+    }
+    const lastDaysMatch = text.match(/last\s+(\d+)\s+days?/i);
+    if (lastDaysMatch) {
+        const end = new Date(today);
+        const start = new Date(today);
+        start.setUTCDate(start.getUTCDate() - Number(lastDaysMatch[1]) + 1);
+        return { label: `last ${lastDaysMatch[1]} days`, startDate: formatDate(start), endDate: formatDate(end) };
+    }
+    if (/this\s+quarter/i.test(text)) {
+        const quarterStartMonth = Math.floor(M / 3) * 3;
+        return { label: "this quarter", startDate: formatDate(new Date(Date.UTC(Y, quarterStartMonth, 1))), endDate: formatDate(new Date(Date.UTC(Y, quarterStartMonth + 3, 0))) };
+    }
+    if (/last\s+quarter/i.test(text)) {
+        const currentQuarterStart = Math.floor(M / 3) * 3;
+        return { label: "last quarter", startDate: formatDate(new Date(Date.UTC(Y, currentQuarterStart - 3, 1))), endDate: formatDate(new Date(Date.UTC(Y, currentQuarterStart, 0))) };
+    }
+    if (/last\s+week/i.test(text)) {
+        const thisWeekStart = new Date(today);
+        thisWeekStart.setUTCDate(today.getUTCDate() - today.getUTCDay());
+        const start = new Date(thisWeekStart);
+        start.setUTCDate(start.getUTCDate() - 7);
+        const end = new Date(thisWeekStart);
+        end.setUTCDate(end.getUTCDate() - 1);
+        return { label: "last week", startDate: formatDate(start), endDate: formatDate(end) };
+    }
     if (/this\s+week/i.test(text)) {
         const dow = today.getDay();
         const start = new Date(today); start.setDate(today.getDate() - dow);
@@ -130,6 +166,17 @@ const isValidDateString = (value) => {
     const parsed = new Date(`${value}T00:00:00Z`);
     return !isNaN(parsed.getTime());
 };
+
+const isHrDataQuestion = (text) => /\b(employee|employees|staff|department|team|leave|leaves|absence|wfh|work\s*from\s*home|record|records|analytics|headcount|count|who|how many|which|most|least|highest|lowest|top|bottom)\b/i.test(text);
+
+const extractDepartmentFromQuestion = (text) => {
+    const match = text.match(/\b(?:in|from|within)\s+(?:the\s+)?([A-Za-z][A-Za-z0-9& -]*?)(?=\s+(?:department|team|this\s+month|last\s+month|this\s+year|last\s+year|between|on\s+\d|as\s+(?:a\s+)?follow.?up|among|who|what)\b|[?.!,]*$)/i);
+    return match?.[1]?.trim().replace(/\s+(?:department|team)$/i, "") || null;
+};
+
+const dedupeNames = (employees) => [...new Map(employees.map(e => [String(e.name).trim().toLowerCase(), String(e.name).trim()])).values()];
+const followsPreviousGroup = (text) => /\b(?:follow.?up|them|those|among|which of|same group|their|these|that group)\b/i.test(text) || /^\s*(?:and\s+)?(?:what|how) about\b/i.test(text);
+const joinNames = (names) => names.length < 2 ? (names[0] || "") : names.length === 2 ? `${names[0]} and ${names[1]}` : `${names.slice(0, -1).join(", ")}, and ${names[names.length - 1]}`;
 
 // ============================================================
 // TOOL SCHEMAS FOR GEMINI FUNCTION CALLING
@@ -249,7 +296,14 @@ const TOOL_SCHEMAS = [
     {
         name: "get_department_leave_comparison",
         description: "Get leave usage comparison across all departments: employee count, leave records, total leave days and average leave days per employee, ranked by usage. Use for 'which department has the highest average leave usage' or department-wise leave comparisons.",
-        parameters: { type: "object", properties: {}, required: [] }
+        parameters: {
+            type: "object",
+            properties: {
+                startDate: { type: "string", description: "Optional start date in YYYY-MM-DD format" },
+                endDate: { type: "string", description: "Optional end date in YYYY-MM-DD format" }
+            },
+            required: []
+        }
     },
     {
         name: "count_employees",
@@ -385,9 +439,14 @@ ${ctxLines ? `\n## Session Context\n${ctxLines}\n` : ""}
 8. Return structured tool calls — never generate HTML or code in responses.
 9. For complex questions that need multiple pieces of information or sequential analysis (e.g. ranking departments by average leave usage, comparing leave across departments), call the required tools in sequence and use earlier results to decide the next step.
 10. Use the get_department_leave_comparison tool when the user asks which department has the highest or lowest average leave usage, or wants a department-wise leave comparison.
+11. Every HR data answer must be grounded in a tool result. Preserve the employee, department, status, group, and date filters stated or clearly carried forward by the user.
+12. If the available result doesn't answer the requested metric or scope, ask a brief clarification or say the data isn't available; never substitute a nearby metric (for example, don't use a top-five list to answer who has the least).
+13. Personalize the wording to the user's actual question and explicitly name the scope used. Report zero results as zero; do not imply missing data means zero unless the query returned zero.
 
 ## Conversation Memory
 - Treat conversation history as the source of truth for follow-up context (last employee/group discussed, department, timeframe, filters).
+- A follow-up asking who took the most leave after an employee list (including "as a follow up", "among them", or "which of them") means rank that previously listed group, preserving any timeframe unless the user changes it.
+- Generic employee questions such as "who are the employees in Engineering?" must query the employee list tool with the department filter.
 - If a follow-up is ambiguous or conflicts with prior context, ask a concise clarification via ask_clarification instead of guessing.
 - Do not silently drop a previously applied department filter; only apply filters the user explicitly mentions or that are clearly carried forward from context.
 
@@ -483,7 +542,10 @@ const executeTool = async (toolName, toolParams, session) => {
         }
 
         case "get_department_leave_comparison": {
-            const comparison = await db_fns.getDepartmentLeaveStats();
+            if (toolParams.startDate && !isValidDateString(toolParams.startDate)) throw new Error("Invalid startDate. Please use YYYY-MM-DD format.");
+            if (toolParams.endDate && !isValidDateString(toolParams.endDate)) throw new Error("Invalid endDate. Please use YYYY-MM-DD format.");
+            if (toolParams.startDate && toolParams.endDate && toolParams.startDate > toolParams.endDate) throw new Error("Start date cannot be after end date.");
+            const comparison = await db_fns.getDepartmentLeaveStats(toolParams);
             return { department_comparison: comparison };
         }
 
@@ -525,23 +587,28 @@ const executeTool = async (toolName, toolParams, session) => {
 // FORMAT TOOL RESULTS
 // ============================================================
 
-const formatToolResult = (toolName, toolParams, result, session) => {
+const formatToolResult = (toolName, toolParams, result, session, userText = "") => {
+    if (toolName === "get_employee_by_name" && Array.isArray(result.employees)) {
+        if (result.employees.length === 1) return formatToolResult(toolName, toolParams, { employee: result.employees[0] }, session, userText);
+        if (result.employees.length === 0) return { message: `I couldn't find an employee named **${toolParams.name}**.` };
+    }
+
     if (result.employees !== undefined) {
         const emps = result.employees;
         const deptLabel = toolParams.department || (emps.length > 0 && emps.every(e => e.department === emps[0].department) ? emps[0].department : null);
         const statusLabel = toolParams.is_active === true ? "active " : toolParams.is_active === false ? "inactive " : "";
 
-        if (deptLabel) session.context.activeDepartment = deptLabel;
-        if (emps.length > 0) {
-            session.context.employeeGroup = emps.map(e => e.name);
-            session.context.lastResultType = "employees";
-            if (emps.length === 1) session.context.activeEmployee = emps[0].name;
-        }
+        session.context.activeDepartment = toolParams.department || null;
+        session.context.employeeGroup = emps.map(e => e.name);
+        session.context.employeeDetails = emps.map(e => ({ id: e.id, name: e.name, department: e.department }));
+        session.context.lastResultType = "employees";
+        session.context.lastTopic = "employees";
+        session.context.activeEmployee = emps.length === 1 ? emps[0].name : null;
 
         return {
             message: emps.length === 0
                 ? `No ${statusLabel}employees found${deptLabel ? ` in the **${deptLabel}** department` : ""}.`
-                : `Found **${emps.length} ${statusLabel}employee(s)**${deptLabel ? ` in the **${deptLabel}** department` : ""}:`,
+                : `${deptLabel ? `In **${deptLabel}**, ` : ""}I found **${emps.length} ${statusLabel}employee${emps.length === 1 ? "" : "s"}**${emps.length <= 12 ? `: ${emps.map(e => `**${e.name}**`).join(", ")}.` : ". The full list is below."}`,
             structuredData: emps.length ? {
                 type: "table",
                 title: deptLabel ? `Employees in ${deptLabel}` : "Employee Results",
@@ -553,6 +620,12 @@ const formatToolResult = (toolName, toolParams, result, session) => {
 
     if (result.employee !== undefined) {
         const emp = result.employee;
+        session.context.activeEmployee = emp.name;
+        session.context.activeDepartment = emp.department;
+        session.context.employeeGroup = [emp.name];
+        session.context.employeeDetails = [{ id: emp.id, name: emp.name, department: emp.department }];
+        session.context.lastResultType = "employees";
+        session.context.lastTopic = "employees";
         return {
             message: `**${emp.name}** is an **${emp.department}** employee with status **${emp.is_active ? "Active" : "Inactive"}**.`,
             structuredData: {
@@ -571,7 +644,9 @@ const formatToolResult = (toolName, toolParams, result, session) => {
     if (result.count !== undefined) {
         const p = result.params || toolParams;
         return {
-            message: `There are **${result.count} employee(s)**${p.department ? ` in the **${p.department}** department` : ""}${p.is_active === true ? " that are currently **active**" : p.is_active === false ? " that are **inactive**" : ""}.`,
+            message: result.count === 0
+                ? `There are no employees${p.department ? ` in the **${p.department}** department` : ""}${p.is_active === true ? " who are currently active" : p.is_active === false ? " who are inactive" : ""}.`
+                : `There ${result.count === 1 ? "is" : "are"} **${result.count} employee${result.count === 1 ? "" : "s"}**${p.department ? ` in the **${p.department}** department` : ""}${p.is_active === true ? " who are currently **active**" : p.is_active === false ? " who are **inactive**" : ""}.`,
             structuredData: {
                 type: "card",
                 title: "Employee Count",
@@ -586,15 +661,40 @@ const formatToolResult = (toolName, toolParams, result, session) => {
         session.context.lastTopic = "leaves";
         const timeLabel = toolParams.startDate ? ` from ${toolParams.startDate} to ${toolParams.endDate || "today"}` : "";
 
-        if (summary.top_employees && summary.top_employees.length > 0 && !toolParams.employee_name) {
+        if (summary.top_employees && summary.top_employees.length > 0 && !toolParams.employee_name && (!toolParams.employee_names?.length || /\b(?:most|highest|top|max(?:imum)?|greatest|biggest|least|fewest|lowest|min(?:imum)?|smallest|bottom)\b/i.test(userText))) {
             session.context.employeeGroup = summary.top_employees.map(e => e.employee_name);
+            session.context.employeeDetails = summary.top_employees.filter(e => e.employee_id).map(e => ({ id: e.employee_id, name: e.employee_real_name || e.employee_name, department: e.department }));
             session.context.lastResultType = "leaves";
             session.context.lastTopic = "leaves";
+            const ranking = summary.top_employees.slice();
+            const asksForLeast = /\b(?:least|fewest|lowest|min(?:imum)?|smallest|bottom)\b/i.test(userText);
+            if (asksForLeast) ranking.reverse();
+            const leaders = ranking.filter(e => e.total_days === ranking[0].total_days);
+            const leaderNames = joinNames(leaders.map(e => `**${e.employee_name}**`));
+            const scope = toolParams.scopeLabel
+                ? `${toolParams.scopeLabel}, `
+                : toolParams.employee_names?.length
+                ? `Among the ${toolParams.employee_names.length} employees we just discussed, `
+                : "Across all employees, ";
+            const rankWord = asksForLeast ? "least" : "most";
+            const leadSentence = `${scope}${leaders.length === 1 ? `${leaderNames} took the ${rankWord} leave` : `${leaderNames} are tied for the ${rankWord} leave`} with **${leaders[0].total_days} day(s)**${timeLabel}.`;
             return {
-                message: `Here are the employees ranked by leave days${timeLabel}:`,
+                message: `${leadSentence} The full ranking is below.`,
                 structuredData: {
                     type: "table",
-                    title: `Leave Rankings${timeLabel}`,
+                    title: `${toolParams.scopeLabel ? "Leave Ranking — Filtered Group" : "Leave Ranking — All Employees"}${timeLabel}`,
+                    columns: ["Employee", "Total Days", "Records"],
+                    rows: ranking.map(e => [e.employee_name, `${e.total_days} day(s)`, `${e.records_count} record(s)`])
+                }
+            };
+        }
+
+        if (toolParams.employee_names?.length && !toolParams.employee_name) {
+            return {
+                message: `${toolParams.scopeLabel ? `${toolParams.scopeLabel}, ` : `For the ${toolParams.employee_names.length} employees we just discussed, `}there were **${summary.total_days} leave day(s)** across **${summary.total_records} record(s)**${timeLabel}. The employee breakdown is below.`,
+                structuredData: {
+                    type: "table",
+                    title: `Leave Totals — Discussed Employees${timeLabel}`,
                     columns: ["Employee", "Total Days", "Records"],
                     rows: summary.top_employees.map(e => [e.employee_name, `${e.total_days} day(s)`, `${e.records_count} record(s)`])
                 }
@@ -603,7 +703,9 @@ const formatToolResult = (toolName, toolParams, result, session) => {
 
         if (toolParams.employee_name) {
             return {
-                message: `**${toolParams.employee_name}** has taken **${summary.total_days} leave day(s)** across **${summary.total_records} record(s)**${timeLabel}.`,
+                message: summary.total_records === 0
+                    ? `No leave records were found for **${toolParams.employee_name}**${timeLabel}.`
+                    : `**${toolParams.employee_name}** has taken **${summary.total_days} leave day(s)** across **${summary.total_records} record(s)**${timeLabel}.`,
                 structuredData: {
                     type: "card",
                     title: `Leave Summary — ${toolParams.employee_name}`,
@@ -630,7 +732,7 @@ const formatToolResult = (toolName, toolParams, result, session) => {
         const records = result.leave_records;
         session.context.lastResultType = "leaves";
         return {
-            message: `Found **${records.length} leave record(s)**${toolParams.employee_name ? ` for **${toolParams.employee_name}**` : ""}:`,
+            message: `Found **${records.length} leave record(s)**${toolParams.employee_name ? ` for **${toolParams.employee_name}**` : toolParams.employee_names?.length ? ` for the ${toolParams.employee_names.length} employees just discussed` : ""}${toolParams.startDate ? ` from ${toolParams.startDate} to ${toolParams.endDate || "today"}` : ""}.`,
             structuredData: records.length ? {
                 type: "table",
                 title: `Leave Records${toolParams.employee_name ? ` — ${toolParams.employee_name}` : ""}`,
@@ -644,11 +746,44 @@ const formatToolResult = (toolName, toolParams, result, session) => {
         const summary = result.wfh_summary;
         session.context.lastResultType = "wfh";
         session.context.lastTopic = "wfh";
+        if (summary.top_employees?.length) session.context.employeeGroup = summary.top_employees.map(e => e.employee_name);
+        const timeLabel = toolParams.startDate ? ` from ${toolParams.startDate} to ${toolParams.endDate || "today"}` : "";
+        if (toolParams.employee_names?.length && !/\b(?:most|highest|top|max(?:imum)?|greatest|biggest|least|fewest|lowest|min(?:imum)?|smallest|bottom)\b/i.test(userText)) {
+            return {
+                message: `${toolParams.scopeLabel ? `${toolParams.scopeLabel}, ` : `For the ${toolParams.employee_names.length} employees we just discussed, `}there were **${summary.total_records} WFH request(s)** across **${summary.unique_employees} employee(s)**${timeLabel}. The employee breakdown is below.`,
+                structuredData: {
+                    type: "table",
+                    title: `WFH Totals — Discussed Employees${timeLabel}`,
+                    columns: ["Employee", "Requests"],
+                    rows: summary.top_employees.map(e => [e.employee_name, e.total_requests])
+                }
+            };
+        }
+        if (summary.top_employees?.length && userText && /\b(?:most|highest|top|least|fewest|lowest|maximum|minimum)\b/i.test(userText)) {
+            const ranking = summary.top_employees.slice();
+            const asksForLeast = /\b(?:least|fewest|lowest|min(?:imum)?|smallest|bottom)\b/i.test(userText);
+            if (asksForLeast) ranking.reverse();
+            const leaders = ranking.filter(e => e.total_requests === ranking[0].total_requests);
+            const names = joinNames(leaders.map(e => `**${e.employee_name}**`));
+            const rankWord = asksForLeast ? "least" : "most";
+            const scope = toolParams.scopeLabel ? `${toolParams.scopeLabel}, ` : "Across employees, ";
+            return {
+                message: `${scope}${names} ${leaders.length === 1 ? `had the ${rankWord} WFH requests` : `are tied for the ${rankWord} WFH requests`} with **${leaders[0].total_requests} request(s)**${timeLabel}. The full ranking is below.`,
+                structuredData: {
+                    type: "table",
+                    title: `WFH Ranking${toolParams.scopeLabel ? toolParams.scopeLabel.includes("current employees") ? " — Current Employees" : " — Filtered Group" : " — All Employees"}${timeLabel}`,
+                    columns: ["Employee", "Requests"],
+                    rows: ranking.map(e => [e.employee_name, e.total_requests])
+                }
+            };
+        }
         const topRequester = summary.top_employees[0]
             ? `${summary.top_employees[0].employee_name} (${summary.top_employees[0].total_requests})`
             : "None";
         return {
-            message: `WFH summary: **${summary.total_records} request(s)** from **${summary.unique_employees} employee(s)**.`,
+            message: toolParams.employee_name && summary.total_records === 0
+                ? `No WFH requests were recorded for **${toolParams.employee_name}**${timeLabel}.`
+                : `${toolParams.employee_name ? `For **${toolParams.employee_name}**, ` : ""}there ${summary.total_records === 1 ? "was" : "were"} **${summary.total_records} WFH request(s)** from **${summary.unique_employees} employee(s)**${timeLabel}.`,
             structuredData: {
                 type: "metrics",
                 title: "WFH Summary",
@@ -665,7 +800,7 @@ const formatToolResult = (toolName, toolParams, result, session) => {
         const records = result.wfh_records;
         session.context.lastResultType = "wfh";
         return {
-            message: `Found **${records.length} WFH record(s)**${toolParams.employee_name ? ` for **${toolParams.employee_name}**` : ""}:`,
+            message: `Found **${records.length} WFH record(s)**${toolParams.employee_name ? ` for **${toolParams.employee_name}**` : toolParams.employee_names?.length ? ` for the ${toolParams.employee_names.length} employees just discussed` : ""}${toolParams.startDate ? ` from ${toolParams.startDate} to ${toolParams.endDate || "today"}` : ""}.`,
             structuredData: records.length ? {
                 type: "table",
                 title: `WFH Records${toolParams.employee_name ? ` — ${toolParams.employee_name}` : ""}`,
@@ -679,16 +814,20 @@ const formatToolResult = (toolName, toolParams, result, session) => {
         const comparison = result.department_comparison;
         const departments = (comparison.departments || []).slice().sort((a, b) => b.avg_leave_days_per_employee - a.avg_leave_days_per_employee);
         const top = departments[0];
+        const requestedTimeframe = parseTimeframe(userText);
+        const timeLabel = toolParams.startDate ? ` during ${requestedTimeframe?.label || `${toolParams.startDate} to ${toolParams.endDate || "today"}`}` : "";
+        const hasUnattributedRecords = departments.some(d => ["Ambiguous", "Unassigned"].includes(d.department) && d.records_count > 0);
+        const attributionNote = hasUnattributedRecords ? " Some leave records couldn't be matched to one employee department, so they are shown separately." : "";
 
         const message = top
-            ? `Across all departments, the **${top.department}** department has the highest average leave usage at **${top.avg_leave_days_per_employee.toFixed(1)} day(s) per employee** — **${top.total_days} total day(s)** across **${top.records_count} record(s)** from **${top.employee_count} employee(s)**.`
-            : "No department-level leave data is available in the database.";
+            ? `Across all departments${timeLabel}, the **${top.department}** department has the highest average leave usage at **${top.avg_leave_days_per_employee.toFixed(1)} day(s) per employee** — **${top.total_days} total day(s)** across **${top.records_count} record(s)** from **${top.employee_count} employee(s)**.${attributionNote}`
+            : `No department-level leave data is available${timeLabel}.${attributionNote}`;
 
         return {
             message,
             structuredData: departments.length ? {
                 type: "table",
-                title: "Department Leave Comparison",
+                title: `Department Leave Comparison${timeLabel}`,
                 columns: ["Department", "Employees", "Leave Records", "Total Days", "Avg Days / Employee"],
                 rows: departments.map(d => [d.department, d.employee_count, d.records_count, `${d.total_days}`, d.avg_leave_days_per_employee.toFixed(1)])
             } : null
@@ -862,6 +1001,7 @@ const runAgentTurn = async (session, userMessage) => {
 
     for (const model of modelsToTry) {
         try {
+            let latestFormattedResult = null;
             const chat = genAI.chats.create({
                 model,
                 config: {
@@ -883,7 +1023,7 @@ const runAgentTurn = async (session, userMessage) => {
                 const textResponse = getAssistantTextFromResponse(response);
 
                 if (functionCalls.length === 0) {
-                    return { text: textResponse, functionCalls: [], pendingProposal: null };
+                    return { text: textResponse, functionCalls: [], pendingProposal: null, formattedResult: latestFormattedResult };
                 }
 
                 const outcomes = [];
@@ -908,6 +1048,10 @@ const runAgentTurn = async (session, userMessage) => {
                             }
                         }
 
+                        // Ground the user-facing answer in the same DB result returned
+                        // to the model, and update follow-up context from that result.
+                        latestFormattedResult = formatToolResult(fc.name, fc.args, rawResult, session, userMessage);
+
                         outcomes.push({ name: fc.name, ok: true, result: rawResult });
                     } catch (err) {
                         console.error(`[Agent] Tool error (${fc.name}):`, err.message);
@@ -930,7 +1074,7 @@ const runAgentTurn = async (session, userMessage) => {
             if (model !== GEMINI_MODEL) {
                 console.log(`[LLM] Using fallback model: ${model}`);
             }
-            return { text: finalText, functionCalls: [], pendingProposal: null };
+            return { text: finalText, functionCalls: [], pendingProposal: null, formattedResult: latestFormattedResult };
 
         } catch (err) {
             const is503 = err.message && (err.message.includes("503") || err.message.includes("high demand") || err.message.includes("UNAVAILABLE"));
@@ -961,11 +1105,14 @@ const callLLM = async (session, userMessage) => {
 
 const ruleBasedFallback = async (text, session) => {
     const lower = text.toLowerCase();
-    const timeframe = parseTimeframe(text) || session.context.activeTimeframe;
-    if (timeframe) session.context.activeTimeframe = timeframe;
+    const requestedTimeframe = parseTimeframe(text);
+    const carriesContext = followsPreviousGroup(text) || /\b(?:same period|that month|that week|then)\b/i.test(text);
+    const timeframe = requestedTimeframe || (carriesContext ? session.context.activeTimeframe : null);
+    if (requestedTimeframe) session.context.activeTimeframe = requestedTimeframe;
+    else if (!carriesContext) session.context.activeTimeframe = null;
 
-    const deptMatch = text.match(/(?:in|from|for|of)\s+(?:the\s+)?([A-Za-z][A-Za-z0-9\s&]+?)(?:\s+department|\s+team|$)/i);
-    let dept = deptMatch ? deptMatch[1].trim() : null;
+    const deptMatch = text.match(/(?:in|from|for|of)\s+(?:the\s+)?([A-Za-z][A-Za-z0-9\s&]+?)(?:\s+department|\s+team)?[?.!,]*$/i);
+    let dept = deptMatch ? deptMatch[1].trim().replace(/\s+(?:department|team)$/i, "") : null;
     if (!dept && /them|those|same|among/i.test(lower)) dept = session.context.activeDepartment;
 
     if (/(?:list|show|who|find|get|display)\s+.*employee|employee/i.test(lower) && !/leave|wfh/i.test(lower)) {
@@ -978,12 +1125,26 @@ const ruleBasedFallback = async (text, session) => {
     }
 
     if (/leave/i.test(lower) && !/create|add|apply|book/i.test(lower)) {
-        const useGroup = /them|those|among/i.test(lower) && session.context.employeeGroup;
+        const isFollowUp = /follow.?up|them|those|among|which of|same group/i.test(lower);
+        const useGroup = isFollowUp && session.context.employeeGroup?.length;
         if (/most|highest|top/i.test(lower)) {
-            const summary = await db_fns.getLeaveSummary({ startDate: timeframe?.startDate, endDate: timeframe?.endDate });
-            let top = summary.top_employees;
-            if (useGroup) top = top.filter(e => session.context.employeeGroup.includes(e.employee_name));
-            return formatToolResult("get_leave_summary", { startDate: timeframe?.startDate, endDate: timeframe?.endDate }, { leave_summary: { ...summary, top_employees: top } }, session);
+            const params = { startDate: timeframe?.startDate, endDate: timeframe?.endDate };
+            let summary;
+            if (useGroup) {
+                params.employee_names = session.context.employeeGroup;
+                const results = await Promise.all(params.employee_names.map(employee_name =>
+                    db_fns.getLeaveSummary({ employee_name, startDate: params.startDate, endDate: params.endDate })
+                ));
+                const top_employees = params.employee_names.map((employee_name, i) => ({
+                    employee_name,
+                    total_days: results[i].total_days,
+                    records_count: results[i].total_records
+                })).sort((a, b) => b.total_days - a.total_days);
+                summary = { top_employees, total_days: top_employees.reduce((sum, e) => sum + e.total_days, 0), total_records: top_employees.reduce((sum, e) => sum + e.records_count, 0), unique_employees: top_employees.length };
+            } else {
+                summary = await db_fns.getLeaveSummary(params);
+            }
+            return formatToolResult("get_leave_summary", params, { leave_summary: summary }, session);
         }
         const summary = await db_fns.getLeaveSummary({ startDate: timeframe?.startDate, endDate: timeframe?.endDate });
         return formatToolResult("get_leave_summary", { startDate: timeframe?.startDate, endDate: timeframe?.endDate }, { leave_summary: summary }, session);
@@ -1000,13 +1161,7 @@ const ruleBasedFallback = async (text, session) => {
     }
 
     return {
-        message: `To enable full natural language understanding, add your **Gemini API key** to \`backend/.env\`:\n\`\`\`\nGEMINI_API_KEY=your-key-here\n\`\`\`\nGet a free key at **aistudio.google.com/apikey**\n\nIn the meantime, try:\n• **"Show employees in Engineering"**\n• **"Who took the most leaves this year?"**\n• **"Show WFH summary this month"**\n• **"Give me the HR overview"**`,
-        suggestedPrompts: [
-            "Show me all employees in Engineering",
-            "Who took the most leaves this year?",
-            "Give me the HR overview",
-            "Show WFH summary this month"
-        ]
+        message: "I couldn't match that question to a reliable HR database lookup, so I don't want to guess. Try naming the employee, department, topic (employees, leave, WFH, or overview), and date range if relevant."
     };
 };
 
@@ -1029,9 +1184,12 @@ const extractEmployeeNameFromText = async (text, context) => {
     }
 
     const nameMatch = text.match(/(?:for|named?|about|change|update|delete|remove)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i);
-    if (nameMatch) return nameMatch[1].trim();
+    if (nameMatch) {
+        const exactEmployee = allEmployees.find(emp => emp.name.trim().toLowerCase() === nameMatch[1].trim().toLowerCase());
+        if (exactEmployee) return exactEmployee.name;
+    }
 
-    if (context?.activeEmployee && /he|she|they|him|her|same|this\s+employee/i.test(text)) {
+    if (context?.activeEmployee && /\b(?:he|she|they|them|him|her|same|this\s+employee)\b/i.test(text)) {
         return context.activeEmployee;
     }
 
@@ -1156,6 +1314,370 @@ const processMessage = async ({ message, sessionId = "default", confirmationActi
     // ─────────────────────────────────────────
 
     session.history.push({ role: "user", content: text });
+    const requestedTimeframe = parseTimeframe(text);
+    const carriesContext = followsPreviousGroup(text) || /\b(?:same period|that month|that week|then)\b/i.test(text);
+    const timeframe = requestedTimeframe || (carriesContext ? session.context.activeTimeframe : null);
+    if (requestedTimeframe) session.context.activeTimeframe = requestedTimeframe;
+    else if (!carriesContext) session.context.activeTimeframe = null;
+
+    // Route explicit department employee-list questions directly to the database.
+    // This avoids a model occasionally dropping a stated department filter.
+    const department = extractDepartmentFromQuestion(text);
+    const isAttendanceQuestion = /\b(?:leave|leaves|absence|absences|wfh|work\s*from\s*home)\b/i.test(text);
+    const checksEmployeeIdentity = isAttendanceQuestion || /\b(?:employee|employees|department|status|profile|who is|who's|tell me about)\b/i.test(text);
+    const isEmployeeCountQuestion = !isAttendanceQuestion && /\b(?:how many|count|number of|total)\b/i.test(text) && /\b(?:employees?|staff|people)\b/i.test(text);
+    const isEmployeeListQuestion = !isAttendanceQuestion && ((/\b(?:who\s+are|who works|list|show|find|get|display|which)\b/i.test(text) && /\b(?:employees?|staff|people|team\s+members?|everyone|all staff)\b/i.test(text)) || (/\bwho\b/i.test(text) && department));
+    const activeFilter = /\binactive\b/i.test(text) ? false : /\bactive\b/i.test(text) ? true : undefined;
+
+    // Validate named departments before any count or attendance aggregate can
+    // silently turn an unknown scope into an all-company query.
+    if (department) {
+        const allEmployees = await db_fns.getAllEmployees();
+        const knownDepartments = [...new Set(allEmployees.map(employee => employee.department).filter(Boolean))];
+        const knownDepartment = knownDepartments.find(name => name.toLowerCase() === department.toLowerCase());
+        if (!knownDepartment) {
+            session.context.activeDepartment = department;
+            session.context.employeeGroup = [];
+            session.context.employeeDetails = [];
+            session.context.lastResultType = "employees";
+            session.context.lastTopic = "employees";
+            const possibleEngineeringAlias = /^engineering$/i.test(department) && knownDepartments.some(name => /^sde$/i.test(name));
+            const result = {
+                message: `I couldn't find an exact **${department}** department match. Departments in this database are ${joinNames(knownDepartments.map(name => `**${name}**`))}.${possibleEngineeringAlias ? " If you mean **SDE**, please confirm and I can use that team." : " Which of these departments did you mean?"}`,
+                needsClarification: true
+            };
+            session.history.push({ role: "assistant", content: result.message });
+            return result;
+        }
+    }
+
+    if (checksEmployeeIdentity) {
+        const employees = await db_fns.getAllEmployees();
+        const mentioned = employees.filter(emp => new RegExp(`\\b${emp.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(text));
+        const narrowed = department ? mentioned.filter(emp => emp.department?.toLowerCase() === department.toLowerCase()) : mentioned;
+        const uniqueNames = new Map(narrowed.map(emp => [emp.name.trim().toLowerCase(), emp.name]));
+        const duplicateName = [...uniqueNames.values()].find(name => narrowed.filter(emp => emp.name.trim().toLowerCase() === name.trim().toLowerCase()).length > 1);
+        if (duplicateName) {
+            const matching = (department ? narrowed : employees).filter(emp => emp.name.trim().toLowerCase() === duplicateName.trim().toLowerCase());
+            const options = matching.map(emp => `${emp.name} (ID ${emp.id}, ${emp.department})`).join("; ");
+            const result = { message: `I found multiple employees named **${duplicateName}**: ${options}. Which employee did you mean?`, needsClarification: true };
+            session.history.push({ role: "assistant", content: result.message });
+            return result;
+        }
+    }
+
+    if (isEmployeeCountQuestion) {
+        const countParams = { ...(department ? { department } : {}), ...(activeFilter !== undefined ? { is_active: activeFilter } : {}) };
+        const count = await db_fns.countEmployees(countParams);
+        const result = formatToolResult("count_employees", countParams, { count, params: countParams }, session);
+        session.history.push({ role: "assistant", content: result.message });
+        return result;
+    }
+
+    if (!isAttendanceQuestion && (/\b(?:which department|what department|department is|status of|details for|details about|who is|who's)\b/i.test(text) || /\b(?:employee\s+id|id)\s*[:#]?\s*\d+/i.test(text))) {
+        const idMatch = text.match(/(?:employee\s+id|id)\s*[:#]?\s*(\d+)/i);
+        if (idMatch) {
+            const employee = await db_fns.getById(Number(idMatch[1]));
+            if (!employee) {
+                const result = { message: `I couldn't find an employee with ID **${idMatch[1]}**.` };
+                session.history.push({ role: "assistant", content: result.message });
+                return result;
+            }
+            const result = formatToolResult("get_employee_by_id", { id: Number(idMatch[1]) }, { employee }, session, text);
+            session.history.push({ role: "assistant", content: result.message });
+            return result;
+        }
+        const employeeName = await extractEmployeeNameFromText(text, session.context);
+        if (employeeName) {
+            const employees = await db_fns.getByName(employeeName);
+            const result = formatToolResult("get_employee_by_name", { name: employeeName }, { employees }, session, text);
+            session.history.push({ role: "assistant", content: result.message });
+            return result;
+        }
+    }
+
+    if (!isAttendanceQuestion && /\b(?:tell me about|profile|show|find|look up|search for|details on)\b/i.test(text)) {
+        const employeeName = await extractEmployeeNameFromText(text, session.context);
+        if (employeeName) {
+            const employees = await db_fns.getByName(employeeName);
+            const result = formatToolResult("get_employee_by_name", { name: employeeName }, { employees }, session, text);
+            session.history.push({ role: "assistant", content: result.message });
+            return result;
+        }
+    }
+
+    if (/\b(?:balance|remaining leave|leave entitlement|leave allowance)\b/i.test(text)) {
+        const result = { message: "I can report leave already recorded, but this database doesn't contain leave allowances or balances, so I can't calculate remaining leave accurately." };
+        session.history.push({ role: "assistant", content: result.message });
+        return result;
+    }
+
+    if (isEmployeeListQuestion) {
+        const listParams = { ...(department ? { department } : {}), ...(activeFilter !== undefined ? { is_active: activeFilter } : {}) };
+        const employees = await db_fns.getAllEmployees(listParams);
+        const result = formatToolResult("search_employees", listParams, { employees }, session, text);
+        if (department && employees.length === 0) {
+            const allEmployees = await db_fns.getAllEmployees();
+            const departments = [...new Set(allEmployees.map(employee => employee.department).filter(Boolean))].sort();
+            const possibleEngineeringAlias = /^engineering$/i.test(department) && departments.some(name => /^sde$/i.test(name));
+            result.message = `I couldn't find an exact **${department}** department match. Departments in this database are ${joinNames(departments.map(name => `**${name}**`))}.${possibleEngineeringAlias ? " If you mean **SDE**, please confirm and I can list that team." : " Which of these departments did you mean?"}`;
+            result.needsClarification = true;
+        }
+        session.history.push({ role: "assistant", content: result.message });
+        return result;
+    }
+
+    if (/\b(?:which|what) department\b/i.test(text) && /\b(?:leave|leaves|average|highest|lowest|most|least)\b/i.test(text)) {
+        const params = { startDate: timeframe?.startDate, endDate: timeframe?.endDate };
+        const comparison = await db_fns.getDepartmentLeaveStats(params);
+        const result = formatToolResult("get_department_leave_comparison", params, { department_comparison: comparison }, session, text);
+        session.history.push({ role: "assistant", content: result.message });
+        return result;
+    }
+
+    // Answer explicit leave rankings directly, using the last employee list for
+    // follow-ups and all employees for a fresh, unqualified ranking.
+    if (/\b(?:leave|leaves|absence|absences)\b/i.test(text) && /\b(?:most|highest|top|max(?:imum)?|greatest|biggest|least|fewest|lowest|min(?:imum)?|smallest|bottom)\b/i.test(text) && !/\b(?:create|add|apply|book)\b/i.test(text)) {
+        const isFollowUp = followsPreviousGroup(text);
+        const employeeMention = await extractEmployeeNameFromText(text, session.context);
+        let employeeRecords = null;
+        let scopeLabel = null;
+        if (employeeMention) {
+            employeeRecords = await db_fns.getByName(employeeMention);
+            scopeLabel = `For **${employeeMention}**`;
+        } else if (department || (isFollowUp && session.context.activeDepartment)) {
+            const scopedDepartment = department || session.context.activeDepartment;
+            employeeRecords = await db_fns.getAllEmployees({ department: scopedDepartment });
+            scopeLabel = `Among employees in **${scopedDepartment}**`;
+        } else if (isFollowUp && session.context.employeeDetails?.length) {
+            employeeRecords = session.context.employeeDetails;
+            scopeLabel = `Among the ${employeeRecords.length} employees just discussed`;
+        } else if (isFollowUp && session.context.employeeGroup?.length) {
+            employeeRecords = dedupeNames(session.context.employeeGroup.map(name => ({ name }))).map(name => ({ name }));
+            scopeLabel = `Among the ${employeeRecords.length} employees just discussed`;
+        }
+        if (employeeRecords && employeeRecords.length === 0) {
+            const result = { message: `I don't have any employees in that scope, so I can't rank leave for it. Please choose a department or employee from the available results.`, needsClarification: true };
+            session.history.push({ role: "assistant", content: result.message });
+            return result;
+        }
+        const asksForLeast = /\b(?:least|fewest|lowest|min(?:imum)?|smallest|bottom)\b/i.test(text);
+        if (asksForLeast && !employeeRecords) {
+            employeeRecords = await db_fns.getAllEmployees();
+            scopeLabel = "Among current employees";
+        }
+        const params = { startDate: timeframe?.startDate, endDate: timeframe?.endDate };
+        if (employeeRecords) {
+            params.employee_names = employeeRecords.map(e => e.name);
+            params.scopeLabel = scopeLabel;
+        }
+        let summary;
+        if (employeeRecords?.length) {
+            const duplicateNameCounts = new Map();
+            for (const employee of employeeRecords) duplicateNameCounts.set(String(employee.name).toLowerCase(), (duplicateNameCounts.get(String(employee.name).toLowerCase()) || 0) + 1);
+            const results = await Promise.all(employeeRecords.map(employee =>
+                db_fns.getLeaveSummary({ employee_id: employee.id, employee_name: employee.name, startDate: params.startDate, endDate: params.endDate })
+            ));
+            const top_employees = employeeRecords.map((employee, i) => ({
+                employee_name: duplicateNameCounts.get(String(employee.name).toLowerCase()) > 1 ? `${employee.name} (${employee.department || `ID ${employee.id}`})` : employee.name,
+                employee_real_name: employee.name,
+                employee_id: employee.id,
+                department: employee.department,
+                total_days: results[i].total_days,
+                records_count: results[i].total_records
+            })).sort((a, b) => b.total_days - a.total_days);
+            summary = { top_employees, total_days: top_employees.reduce((sum, e) => sum + e.total_days, 0), total_records: top_employees.reduce((sum, e) => sum + e.records_count, 0), unique_employees: top_employees.length };
+        } else {
+            summary = await db_fns.getLeaveSummary(params);
+        }
+        const result = formatToolResult("get_leave_summary", params, { leave_summary: summary }, session, text);
+        session.history.push({ role: "assistant", content: result.message });
+        return result;
+    }
+
+    if (!isAttendanceQuestion && /\b(?:department|departments|team|teams)\b/i.test(text) && /\b(?:what|which|list|show|largest|biggest|most|smallest|least)\b/i.test(text)) {
+        const employees = await db_fns.getAllEmployees({ is_active: true });
+        const counts = new Map();
+        for (const employee of employees) counts.set(employee.department, (counts.get(employee.department) || 0) + 1);
+        let departments = [...counts].map(([name, employeeCount]) => ({ name, employeeCount }));
+        if (/\b(?:largest|biggest|most)\b/i.test(text)) departments.sort((a, b) => b.employeeCount - a.employeeCount);
+        else if (/\b(?:smallest|least)\b/i.test(text)) departments.sort((a, b) => a.employeeCount - b.employeeCount);
+        const asksForLargest = /\b(?:largest|biggest|most)\b/i.test(text);
+        const asksForSmallest = /\b(?:smallest|least)\b/i.test(text);
+        const leaders = (asksForLargest || asksForSmallest) && departments.length
+            ? departments.filter(item => item.employeeCount === departments[0].employeeCount)
+            : [];
+        const message = leaders.length
+            ? `${joinNames(leaders.map(item => `**${item.name}**`))} ${leaders.length === 1 ? "has" : "are tied with"} the ${asksForLargest ? "most" : "fewest"} active employees (**${leaders[0].employeeCount}**).`
+            : `There are **${departments.length} active department(s)**. The employee counts are below.`;
+        const result = {
+            message,
+            structuredData: departments.length ? {
+                type: "table",
+                title: "Active Employees by Department",
+                columns: ["Department", "Employees"],
+                rows: departments.map(item => [item.name, item.employeeCount])
+            } : null
+        };
+        session.history.push({ role: "assistant", content: result.message });
+        return result;
+    }
+
+    const isWfhQuestion = /\b(?:wfh|work\s*from\s*home|remote work)\b/i.test(text);
+    if (isWfhQuestion && /\b(?:which|what) department\b/i.test(text)) {
+        const summary = await db_fns.getWfhSummary({ startDate: timeframe?.startDate, endDate: timeframe?.endDate });
+        const departments = (summary.department_breakdown || []).slice().sort((a, b) => b.total_requests - a.total_requests);
+        const leader = departments[0];
+        const timeLabel = timeframe ? ` during ${timeframe.label}` : "";
+        const result = {
+            message: leader
+                ? `The **${leader.department}** department had the most WFH requests${timeLabel}, with **${leader.total_requests} request(s)**. Here is the department breakdown.`
+                : `There are no WFH requests${timeLabel} to compare by department.`,
+            structuredData: departments.length ? {
+                type: "table",
+                title: `WFH Requests by Department${timeframe ? ` — ${timeframe.label}` : ""}`,
+                columns: ["Department", "Requests"],
+                rows: departments.map(d => [d.department, d.total_requests])
+            } : null
+        };
+        session.history.push({ role: "assistant", content: result.message });
+        session.context.lastResultType = "wfh";
+        session.context.lastTopic = "wfh";
+        return result;
+    }
+    const isWfhRankingQuestion = isWfhQuestion && /\b(?:most|highest|top|max(?:imum)?|greatest|biggest|least|fewest|lowest|min(?:imum)?|smallest|bottom)\b/i.test(text);
+    if (isWfhRankingQuestion) {
+        const isFollowUp = followsPreviousGroup(text);
+        const employeeMention = await extractEmployeeNameFromText(text, session.context);
+        let employeeNames = null;
+        let scopeLabel = null;
+        if (employeeMention) {
+            employeeNames = [employeeMention];
+            scopeLabel = `For **${employeeMention}**`;
+        } else if (department || (isFollowUp && session.context.activeDepartment)) {
+            const scopedDepartment = department || session.context.activeDepartment;
+            employeeNames = dedupeNames(await db_fns.getAllEmployees({ department: scopedDepartment }));
+            scopeLabel = `Among employees in **${scopedDepartment}**`;
+        } else if (isFollowUp && session.context.employeeGroup?.length) {
+            employeeNames = dedupeNames(session.context.employeeGroup.map(name => ({ name })));
+            scopeLabel = `Among the ${employeeNames.length} employees just discussed`;
+        }
+        if (employeeNames && employeeNames.length === 0) {
+            const result = { message: `I don't have any employees in that scope, so I can't rank WFH requests for it. Please choose a department or employee from the available results.`, needsClarification: true };
+            session.history.push({ role: "assistant", content: result.message });
+            return result;
+        }
+        const asksForLeast = /\b(?:least|fewest|lowest|min(?:imum)?|smallest|bottom)\b/i.test(text);
+        if (asksForLeast && !employeeNames) {
+            employeeNames = dedupeNames(await db_fns.getAllEmployees());
+            scopeLabel = "Among current employees";
+        }
+        const params = { startDate: timeframe?.startDate, endDate: timeframe?.endDate };
+        if (employeeNames?.length) {
+            const results = await Promise.all(employeeNames.map(employee_name =>
+                db_fns.getWfhSummary({ employee_name, startDate: params.startDate, endDate: params.endDate })
+            ));
+            params.scopeLabel = scopeLabel;
+            const top_employees = employeeNames.map((employee_name, index) => ({
+                employee_name,
+                total_requests: results[index].total_records
+            })).sort((a, b) => b.total_requests - a.total_requests);
+            const summary = { total_records: top_employees.reduce((sum, item) => sum + item.total_requests, 0), unique_employees: employeeNames.length, top_employees, department_breakdown: [] };
+            const result = formatToolResult("get_wfh_summary", params, { wfh_summary: summary }, session, text);
+            session.history.push({ role: "assistant", content: result.message });
+            return result;
+        }
+        const summary = await db_fns.getWfhSummary(params);
+        const result = formatToolResult("get_wfh_summary", params, { wfh_summary: summary }, session, text);
+        session.history.push({ role: "assistant", content: result.message });
+        return result;
+    }
+
+    if (isWfhQuestion && !/\b(?:create|add|apply|book|request)\b/i.test(text)) {
+        const employeeName = await extractEmployeeNameFromText(text, session.context);
+        const useGroup = !employeeName && !department && followsPreviousGroup(text) && session.context.employeeGroup?.length;
+        const employeeNames = employeeName ? null : department
+            ? dedupeNames(await db_fns.getAllEmployees({ department }))
+            : useGroup ? dedupeNames(session.context.employeeGroup.map(name => ({ name }))) : null;
+        const scopeLabel = department ? `Among employees in **${department}**` : useGroup ? `Among the ${employeeNames.length} employees just discussed` : null;
+        if (employeeNames && employeeNames.length === 0) {
+            const result = { message: `I don't have any employees in that scope, so I can't summarize WFH requests for it. Please choose a department or employee from the available results.`, needsClarification: true };
+            session.history.push({ role: "assistant", content: result.message });
+            return result;
+        }
+        const params = { ...(employeeName ? { employee_name: employeeName } : {}), ...(employeeNames ? { employee_names: employeeNames } : {}), startDate: timeframe?.startDate, endDate: timeframe?.endDate };
+        if (scopeLabel) params.scopeLabel = scopeLabel;
+        const wantsRecords = /\b(?:records?|dates?|when|history|reason|why)\b/i.test(text) || /\b(?:list|show)\b.*\b(?:requests?|entries|dates?)\b/i.test(text) || /\bwho\b.*\b(?:wfh|work\s*from\s*home)\b/i.test(text);
+        let raw;
+        if (wantsRecords && employeeNames?.length) {
+            const records = await Promise.all(employeeNames.map(name => db_fns.getAllWfh({ employee_name: name, startDate: params.startDate, endDate: params.endDate, limit: 100 })));
+            raw = { wfh_records: records.flat() };
+        } else if (wantsRecords) {
+            raw = { wfh_records: await db_fns.getAllWfh({ ...params, limit: 100 }) };
+        } else if (employeeNames?.length) {
+            const summaries = await Promise.all(employeeNames.map(employee_name => db_fns.getWfhSummary({ employee_name, startDate: params.startDate, endDate: params.endDate })));
+            const top_employees = employeeNames.map((employee_name, i) => ({ employee_name, total_requests: summaries[i].total_records })).sort((a, b) => b.total_requests - a.total_requests);
+            raw = { wfh_summary: { total_records: top_employees.reduce((sum, e) => sum + e.total_requests, 0), unique_employees: top_employees.filter(e => e.total_requests > 0).length, top_employees, department_breakdown: [] } };
+            params.scopeLabel = `Among the ${employeeNames.length} employees just discussed`;
+        } else {
+            raw = { wfh_summary: await db_fns.getWfhSummary(params) };
+        }
+        const toolName = wantsRecords ? "get_wfh_records" : "get_wfh_summary";
+        const result = formatToolResult(toolName, params, raw, session, text);
+        session.history.push({ role: "assistant", content: result.message });
+        return result;
+    }
+
+    if (/\bleave|leaves|absence|absences\b/i.test(text) && !/\b(?:create|add|apply|book|request)\b/i.test(text)) {
+        const employeeName = await extractEmployeeNameFromText(text, session.context);
+        const useGroup = !employeeName && !department && followsPreviousGroup(text) && session.context.employeeGroup?.length;
+        const employeeRecords = employeeName ? await db_fns.getByName(employeeName) : department
+            ? await db_fns.getAllEmployees({ department })
+            : useGroup ? session.context.employeeDetails : null;
+        if (employeeRecords && employeeRecords.length === 0) {
+            const result = { message: `I don't have any employees in that scope, so I can't summarize leave for it. Please choose a department or employee from the available results.`, needsClarification: true };
+            session.history.push({ role: "assistant", content: result.message });
+            return result;
+        }
+        const employeeNames = employeeRecords?.map(employee => employee.name) || null;
+        const scopeLabel = department ? `Among employees in **${department}**` : useGroup ? `Among the ${employeeRecords.length} employees just discussed` : null;
+        const params = { ...(employeeName ? { employee_name: employeeName } : {}), ...(employeeNames ? { employee_names: employeeNames } : {}), startDate: timeframe?.startDate, endDate: timeframe?.endDate };
+        if (scopeLabel) params.scopeLabel = scopeLabel;
+        const wantsRecords = /\b(?:records?|dates?|when|history|which days|types?|full.day|half.day)\b/i.test(text) || /\b(?:list|show)\b.*\b(?:requests?|entries|dates?)\b/i.test(text) || /\b(?:who|which employees?)\b.*\b(?:took|on|had)\b.*\bleave\b/i.test(text);
+        let raw;
+        if (wantsRecords && employeeRecords?.length && !employeeName) {
+            const records = await Promise.all(employeeRecords.map(employee => db_fns.getAllLeaves({ employee_id: employee.id, employee_name: employee.name, startDate: params.startDate, endDate: params.endDate, limit: 100 })));
+            raw = { leave_records: records.flat() };
+        } else if (wantsRecords) {
+            raw = { leave_records: await db_fns.getAllLeaves({ ...params, limit: 100 }) };
+        } else if (employeeRecords?.length && !employeeName) {
+            const summaries = await Promise.all(employeeRecords.map(employee => db_fns.getLeaveSummary({ employee_id: employee.id, employee_name: employee.name, startDate: params.startDate, endDate: params.endDate })));
+            const nameCounts = new Map();
+            employeeRecords.forEach(employee => nameCounts.set(employee.name.toLowerCase(), (nameCounts.get(employee.name.toLowerCase()) || 0) + 1));
+            const top_employees = employeeRecords.map((employee, i) => ({
+                employee_name: nameCounts.get(employee.name.toLowerCase()) > 1 ? `${employee.name} (${employee.department || `ID ${employee.id}`})` : employee.name,
+                employee_real_name: employee.name,
+                employee_id: employee.id,
+                department: employee.department,
+                total_days: summaries[i].total_days,
+                records_count: summaries[i].total_records
+            })).sort((a, b) => b.total_days - a.total_days);
+            raw = { leave_summary: { total_days: top_employees.reduce((sum, e) => sum + e.total_days, 0), total_records: top_employees.reduce((sum, e) => sum + e.records_count, 0), unique_employees: top_employees.filter(e => e.records_count > 0).length, top_employees, department_breakdown: [] } };
+        } else {
+            raw = { leave_summary: await db_fns.getLeaveSummary(params) };
+        }
+        const toolName = wantsRecords ? "get_leave_records" : "get_leave_summary";
+        const result = formatToolResult(toolName, params, raw, session, text);
+        session.history.push({ role: "assistant", content: result.message });
+        return result;
+    }
+
+    if (/\b(?:overall|overview|analytics|dashboard|company metrics|HR summary)\b/i.test(text)) {
+        const analytics = await db_fns.getHrAnalytics();
+        const result = formatToolResult("get_hr_analytics", {}, { hr_analytics: analytics }, session, text);
+        session.history.push({ role: "assistant", content: result.message });
+        return result;
+    }
 
     const llmResult = await callLLM(session, text);
 
@@ -1178,7 +1700,12 @@ const processMessage = async ({ message, sessionId = "default", confirmationActi
         }
 
         // Final answer produced by the LLM after (optionally) running tools
-        if (llmResult.text) {
+        if (llmResult.formattedResult) {
+            session.history.push({ role: "assistant", content: llmResult.formattedResult.message });
+            return llmResult.formattedResult;
+        }
+
+        if (llmResult.text && !isHrDataQuestion(text)) {
             session.history.push({ role: "assistant", content: llmResult.text });
             return { message: llmResult.text };
         }

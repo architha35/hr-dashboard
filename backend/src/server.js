@@ -13,6 +13,9 @@ app.use(cors({
     origin: [
         "http://localhost:5173",
         "http://localhost:5174",
+        "http://localhost:5176",
+        "http://localhost:5177",
+        "http://localhost:5178",
         "http://localhost:3000",
         "https://hr-dashboard-2-65et.onrender.com"
     ]
@@ -198,6 +201,7 @@ process.on("uncaughtException", (err) => {
 });
 
 // Start Server
-app.listen(4000, () => {
-  console.log("Server running on http://localhost:4000");
+const PORT = Number(process.env.PORT) || 4000;
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
 });

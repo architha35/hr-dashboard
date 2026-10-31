@@ -187,7 +187,18 @@ const getAllLeaves = async (filters = {}) => {
     const params = [];
     let idx = 1;
 
-    if (filters.employee_name) {
+    if (filters.employee_id && filters.employee_name) {
+        const employeeIdIndex = idx++;
+        const employeeNameIndex = idx++;
+        conditions.push(`(employee_id = $${employeeIdIndex} OR (employee_id IS NULL AND LOWER(TRIM(employee_name)) = LOWER(TRIM($${employeeNameIndex})) AND NOT EXISTS (
+            SELECT 1 FROM employees same_name
+            WHERE same_name.id <> $${employeeIdIndex} AND LOWER(TRIM(same_name.name)) = LOWER(TRIM($${employeeNameIndex}))
+        )))`);
+        params.push(Number(filters.employee_id), filters.employee_name.trim());
+    } else if (filters.employee_id) {
+        conditions.push(`employee_id = $${idx++}`);
+        params.push(Number(filters.employee_id));
+    } else if (filters.employee_name) {
         conditions.push(`LOWER(employee_name) = LOWER($${idx++})`);
         params.push(filters.employee_name.trim());
     }
@@ -257,7 +268,18 @@ const getLeaveSummary = async (filters = {}) => {
     const params = [];
     let idx = 1;
 
-    if (filters.employee_name) {
+    if (filters.employee_id && filters.employee_name) {
+        const employeeIdIndex = idx++;
+        const employeeNameIndex = idx++;
+        conditions.push(`(employee_id = $${employeeIdIndex} OR (employee_id IS NULL AND LOWER(TRIM(employee_name)) = LOWER(TRIM($${employeeNameIndex})) AND NOT EXISTS (
+            SELECT 1 FROM employees same_name
+            WHERE same_name.id <> $${employeeIdIndex} AND LOWER(TRIM(same_name.name)) = LOWER(TRIM($${employeeNameIndex}))
+        )))`);
+        params.push(Number(filters.employee_id), filters.employee_name.trim());
+    } else if (filters.employee_id) {
+        conditions.push(`employee_id = $${idx++}`);
+        params.push(Number(filters.employee_id));
+    } else if (filters.employee_name) {
         conditions.push(`LOWER(employee_name) = LOWER($${idx++})`);
         params.push(filters.employee_name.trim());
     }
@@ -300,13 +322,18 @@ const getLeaveSummary = async (filters = {}) => {
     // Department breakdown if employees table joined
     const deptQuery = `
         SELECT 
-            COALESCE(e.department, 'Unassigned') AS department,
+            CASE
+                WHEN l.employee_id IS NULL AND (SELECT COUNT(*) FROM employees same_name WHERE LOWER(TRIM(same_name.name)) = LOWER(TRIM(l.employee_name))) > 1 THEN 'Ambiguous'
+                ELSE COALESCE(e.department, 'Unassigned')
+            END AS department,
             COUNT(l.id)::int AS records_count,
             COALESCE(SUM(l.no_of_leaves), 0)::numeric AS total_days
         FROM leave_records l
-        LEFT JOIN employees e ON LOWER(l.employee_name) = LOWER(e.name)
+        LEFT JOIN employees e ON (l.employee_id IS NOT NULL AND e.id = l.employee_id)
+            OR (l.employee_id IS NULL AND LOWER(TRIM(l.employee_name)) = LOWER(TRIM(e.name))
+                AND (SELECT COUNT(*) FROM employees same_name WHERE LOWER(TRIM(same_name.name)) = LOWER(TRIM(l.employee_name))) = 1)
         ${where}
-        GROUP BY e.department
+        GROUP BY 1
         ORDER BY total_days DESC
     `;
     const deptResult = await pool.query(deptQuery, params);
@@ -446,11 +473,17 @@ const getWfhSummary = async (filters = {}) => {
 
     // Department breakdown
     const deptQuery = `
+        WITH employee_departments AS (
+            SELECT LOWER(TRIM(name)) AS employee_key,
+                   CASE WHEN COUNT(DISTINCT department) = 1 THEN MIN(department) ELSE 'Ambiguous' END AS department
+            FROM employees
+            GROUP BY LOWER(TRIM(name))
+        )
         SELECT 
             COALESCE(e.department, 'Unassigned') AS department,
             COUNT(w.id)::int AS total_requests
         FROM wfh w
-        LEFT JOIN employees e ON LOWER(w.employee_name) = LOWER(e.name)
+        LEFT JOIN employee_departments e ON LOWER(TRIM(w.employee_name)) = e.employee_key
         ${where}
         GROUP BY e.department
         ORDER BY total_requests DESC
@@ -469,20 +502,34 @@ const getWfhSummary = async (filters = {}) => {
 // DEPARTMENT LEAVE COMPARISON
 // ==========================================
 
-const getDepartmentLeaveStats = async () => {
+const getDepartmentLeaveStats = async (filters = {}) => {
+    const params = [];
+    const dateConditions = [];
+    if (filters.startDate) {
+        params.push(filters.startDate);
+        dateConditions.push(`l.leave_date >= $${params.length}`);
+    }
+    if (filters.endDate) {
+        params.push(filters.endDate);
+        dateConditions.push(`l.leave_date <= $${params.length}`);
+    }
     const leavesQuery = `
         SELECT
-            COALESCE(e.department, 'Unassigned') AS department,
+            e.department AS department,
             COUNT(DISTINCT e.id)::int AS employee_count,
             COUNT(l.id)::int AS records_count,
             COALESCE(SUM(l.no_of_leaves), 0)::numeric AS total_days
         FROM employees e
-        LEFT JOIN leave_records l ON LOWER(l.employee_name) = LOWER(e.name)
-        GROUP BY COALESCE(e.department, 'Unassigned')
+        LEFT JOIN leave_records l ON (
+            (l.employee_id IS NOT NULL AND l.employee_id = e.id)
+            OR (l.employee_id IS NULL AND LOWER(TRIM(l.employee_name)) = LOWER(TRIM(e.name))
+                AND (SELECT COUNT(*) FROM employees same_name WHERE LOWER(TRIM(same_name.name)) = LOWER(TRIM(l.employee_name))) = 1)
+        )${dateConditions.length ? ` AND ${dateConditions.join(" AND ")}` : ""}
+        GROUP BY e.department
         ORDER BY total_days DESC, employee_count DESC
     `;
 
-    const leavesResult = await pool.query(leavesQuery);
+    const leavesResult = await pool.query(leavesQuery, params);
     const departments = leavesResult.rows.map((row) => {
         const employeeCount = Number(row.employee_count) || 0;
         const totalDays = Number(row.total_days) || 0;
@@ -494,6 +541,33 @@ const getDepartmentLeaveStats = async () => {
             avg_leave_days_per_employee: employeeCount > 0 ? totalDays / employeeCount : 0
         };
     });
+
+    const unmappedQuery = `
+        SELECT
+            CASE WHEN l.employee_id IS NULL AND EXISTS (
+                SELECT 1 FROM employees e WHERE LOWER(TRIM(e.name)) = LOWER(TRIM(l.employee_name))
+            ) THEN 'Ambiguous' ELSE 'Unassigned' END AS department,
+            COUNT(*)::int AS records_count,
+            COALESCE(SUM(l.no_of_leaves), 0)::numeric AS total_days
+        FROM leave_records l
+        WHERE NOT EXISTS (
+            SELECT 1 FROM employees e
+            WHERE (l.employee_id IS NOT NULL AND e.id = l.employee_id)
+               OR (l.employee_id IS NULL AND LOWER(TRIM(l.employee_name)) = LOWER(TRIM(e.name))
+                   AND (SELECT COUNT(*) FROM employees same_name WHERE LOWER(TRIM(same_name.name)) = LOWER(TRIM(l.employee_name))) = 1)
+        )${dateConditions.length ? ` AND ${dateConditions.join(" AND ")}` : ""}
+        GROUP BY 1
+    `;
+    const unmappedResult = await pool.query(unmappedQuery, params);
+    for (const row of unmappedResult.rows) {
+        departments.push({
+            department: row.department,
+            employee_count: 0,
+            records_count: Number(row.records_count) || 0,
+            total_days: Number(row.total_days) || 0,
+            avg_leave_days_per_employee: 0
+        });
+    }
 
     return { departments };
 };
