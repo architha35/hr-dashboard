@@ -2,6 +2,7 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
+const crypto = require("crypto");
 const pool = require("./db/db");
 const { db_fns } = require("./db");
 
@@ -24,6 +25,53 @@ app.use(cors({ origin: allowedOrigins }));
 
 app.get("/api/test", async (req,res ) => {
   return res.send("working!");
+});
+
+const safeEqual = (left, right) => crypto.timingSafeEqual(
+    crypto.createHash("sha256").update(String(left)).digest(),
+    crypto.createHash("sha256").update(String(right)).digest()
+);
+
+const issueAuthToken = () => {
+    const payload = Buffer.from(JSON.stringify({ exp: Date.now() + 8 * 60 * 60 * 1000 })).toString("base64url");
+    const signature = crypto.createHmac("sha256", process.env.SESSION_SECRET).update(payload).digest("base64url");
+    return `${payload}.${signature}`;
+};
+
+const isValidAuthToken = (token) => {
+    if (!token || !process.env.SESSION_SECRET) return false;
+    const [payload, signature] = token.split(".");
+    if (!payload || !signature) return false;
+    const expected = crypto.createHmac("sha256", process.env.SESSION_SECRET).update(payload).digest("base64url");
+    if (!safeEqual(signature, expected)) return false;
+    try {
+        return JSON.parse(Buffer.from(payload, "base64url").toString()).exp > Date.now();
+    } catch {
+        return false;
+    }
+};
+
+app.post("/api/auth/login", (req, res) => {
+    if (!process.env.ADMIN_PASSWORD || !process.env.SESSION_SECRET) {
+        return res.status(503).json({ error: "Admin authentication is not configured" });
+    }
+    const { password } = req.body || {};
+    if (!password || !safeEqual(password, process.env.ADMIN_PASSWORD)) {
+        return res.status(401).json({ error: "Incorrect password" });
+    }
+    return res.json({ token: issueAuthToken() });
+});
+
+app.get("/api/auth/session", (req, res) => {
+    const token = req.get("authorization")?.replace(/^Bearer\s+/i, "");
+    return isValidAuthToken(token) ? res.json({ authenticated: true }) : res.status(401).json({ authenticated: false });
+});
+
+app.use("/api", (req, res, next) => {
+    if (req.path === "/test" || req.path === "/auth/login" || req.path === "/auth/session") return next();
+    const token = req.get("authorization")?.replace(/^Bearer\s+/i, "");
+    if (!isValidAuthToken(token)) return res.status(401).json({ error: "Authentication required" });
+    return next();
 });
 
 // Employee search endpoint: queries DB for matching names

@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef } from "react";
 import { API_BASE_URL } from "../api/config";
+import { apiFetch } from "../api/request";
 
 const View = () => {
     const [employees, setEmployees] = useState([]);
@@ -25,7 +26,7 @@ const View = () => {
                 ? `${API_BASE_URL}/employees/search?q=${encodeURIComponent(search.trim())}`
                 : `${API_BASE_URL}/employees`;
 
-            const response = await fetch(url, { signal: controller.signal });
+            const response = await apiFetch(url, { signal: controller.signal });
             if (!response.ok) {
                 throw new Error("Failed to load employees");
             }

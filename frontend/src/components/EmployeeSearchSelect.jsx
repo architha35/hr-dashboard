@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { API_BASE_URL } from "../api/config";
+import { apiFetch } from "../api/request";
 
 const EmployeeSearchSelect = ({
     selectedEmployee,
@@ -68,7 +69,7 @@ const EmployeeSearchSelect = ({
 
         const timer = setTimeout(async () => {
             try {
-                const response = await fetch(
+                const response = await apiFetch(
                     `${API_BASE_URL}/employees/search?q=${encodeURIComponent(trimmed)}`,
                     { signal: controller.signal }
                 );
