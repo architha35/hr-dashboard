@@ -286,6 +286,10 @@ const tools = {
     // ----------------------------------------
     get_hr_analytics: async () => {
         return await db_fns.getHrAnalytics();
+    },
+
+    get_department_leave_comparison: async () => {
+        return await db_fns.getDepartmentLeaveStats();
     }
 };
 

@@ -22,9 +22,20 @@ if (GEMINI_API_KEY) {
 
 const sessions = new Map();
 
+const SESSION_IDLE_LIMIT_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
 const getSession = (sessionId = "default") => {
-    if (!sessions.has(sessionId)) {
-        sessions.set(sessionId, {
+    let session = sessions.get(sessionId);
+    const now = Date.now();
+
+    if (session && session.lastActivity && now - session.lastActivity > SESSION_IDLE_LIMIT_MS) {
+        // Drop conversations that have been idle for too long
+        sessions.delete(sessionId);
+        session = undefined;
+    }
+
+    if (!session) {
+        session = {
             id: sessionId,
             history: [],
             context: {
@@ -37,9 +48,13 @@ const getSession = (sessionId = "default") => {
                 employeeGroup: null,
             },
             pendingProposal: null,
-        });
+            lastActivity: now,
+        };
+        sessions.set(sessionId, session);
     }
-    return sessions.get(sessionId);
+
+    session.lastActivity = now;
+    return session;
 };
 
 // ============================================================
@@ -102,6 +117,13 @@ const parseTimeframe = (text) => {
     const isoMatch = text.match(/\b(\d{4}-\d{2}-\d{2})\b/);
     if (isoMatch) return { label: isoMatch[1], date: isoMatch[1], startDate: isoMatch[1], endDate: isoMatch[1] };
     return null;
+};
+
+const isValidDateString = (value) => {
+    if (typeof value !== "string") return false;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+    const parsed = new Date(`${value}T00:00:00Z`);
+    return !isNaN(parsed.getTime());
 };
 
 // ============================================================
@@ -182,6 +204,46 @@ const TOOL_SCHEMAS = [
     {
         name: "get_hr_analytics",
         description: "Get overall HR analytics: total employees, leave days, WFH counts, department breakdown.",
+        parameters: { type: "object", properties: {}, required: [] }
+    },
+    {
+        name: "get_employee_by_id",
+        description: "Get a single employee by their database ID. Use when the user provides or asks about a specific employee ID.",
+        parameters: {
+            type: "object",
+            properties: {
+                id: { type: "number", description: "Employee database ID" }
+            },
+            required: ["id"]
+        }
+    },
+    {
+        name: "get_employee_by_name",
+        description: "Get employee(s) by exact name. Use to resolve a specific employee mentioned by name.",
+        parameters: {
+            type: "object",
+            properties: {
+                name: { type: "string", description: "Exact employee name" }
+            },
+            required: ["name"]
+        }
+    },
+    {
+        name: "get_all_employees",
+        description: "List all employees, optionally filtered by department or active status. Use for broad employee listings.",
+        parameters: {
+            type: "object",
+            properties: {
+                department: { type: "string", description: "Filter by exact department name" },
+                is_active: { type: "boolean", description: "Filter by active status. Omit for all." },
+                limit: { type: "number", description: "Max results (default 50)" }
+            },
+            required: []
+        }
+    },
+    {
+        name: "get_department_leave_comparison",
+        description: "Get leave usage comparison across all departments: employee count, leave records, total leave days and average leave days per employee, ranked by usage. Use for 'which department has the highest average leave usage' or department-wise leave comparisons.",
         parameters: { type: "object", properties: {}, required: [] }
     },
     {
@@ -316,11 +378,19 @@ ${ctxLines ? `\n## Session Context\n${ctxLines}\n` : ""}
 6. For timeframe-only follow-ups like "what about last month?", reuse the previous tool with updated dates.
 7. For ambiguous references, call ask_clarification instead of assuming.
 8. Return structured tool calls — never generate HTML or code in responses.
+9. For complex questions that need multiple pieces of information or sequential analysis (e.g. ranking departments by average leave usage, comparing leave across departments), call the required tools in sequence and use earlier results to decide the next step.
+10. Use the get_department_leave_comparison tool when the user asks which department has the highest or lowest average leave usage, or wants a department-wise leave comparison.
+
+## Conversation Memory
+- Treat conversation history as the source of truth for follow-up context (last employee/group discussed, department, timeframe, filters).
+- If a follow-up is ambiguous or conflicts with prior context, ask a concise clarification via ask_clarification instead of guessing.
+- Do not silently drop a previously applied department filter; only apply filters the user explicitly mentions or that are clearly carried forward from context.
 
 ## Tool Selection Guide
-- List/find employees → search_employees (with department or query params)
+- List/find employees → search_employees / get_all_employees / get_employee_by_id / get_employee_by_name
 - Count employees → count_employees
 - Leave rankings/totals → get_leave_summary
+- Department leave comparison → get_department_leave_comparison
 - Specific leave records → get_leave_records
 - WFH summary → get_wfh_summary
 - WFH records → get_wfh_records
@@ -357,6 +427,10 @@ const executeTool = async (toolName, toolParams, session) => {
         }
 
         case "get_leave_summary": {
+            if (toolParams.startDate && !isValidDateString(toolParams.startDate)) throw new Error("Invalid startDate. Please use YYYY-MM-DD format.");
+            if (toolParams.endDate && !isValidDateString(toolParams.endDate)) throw new Error("Invalid endDate. Please use YYYY-MM-DD format.");
+            if (toolParams.startDate && toolParams.endDate && toolParams.startDate > toolParams.endDate) throw new Error("Start date cannot be after end date.");
+
             if (toolParams.employee_names && toolParams.employee_names.length > 0) {
                 const results = await Promise.all(
                     toolParams.employee_names.map(name =>
@@ -375,16 +449,25 @@ const executeTool = async (toolName, toolParams, session) => {
         }
 
         case "get_leave_records": {
+            if (toolParams.startDate && !isValidDateString(toolParams.startDate)) throw new Error("Invalid startDate. Please use YYYY-MM-DD format.");
+            if (toolParams.endDate && !isValidDateString(toolParams.endDate)) throw new Error("Invalid endDate. Please use YYYY-MM-DD format.");
+            if (toolParams.leave_type && !["FULL_DAY", "HALF_DAY"].includes(String(toolParams.leave_type).toUpperCase())) throw new Error("Invalid leave_type. Must be FULL_DAY or HALF_DAY.");
+            if (toolParams.limit !== undefined && (!Number.isFinite(Number(toolParams.limit)) || Number(toolParams.limit) < 1)) throw new Error("Invalid limit. Must be a positive number.");
             const records = await db_fns.getAllLeaves(toolParams);
             return { leave_records: records };
         }
 
         case "get_wfh_summary": {
+            if (toolParams.startDate && !isValidDateString(toolParams.startDate)) throw new Error("Invalid startDate. Please use YYYY-MM-DD format.");
+            if (toolParams.endDate && !isValidDateString(toolParams.endDate)) throw new Error("Invalid endDate. Please use YYYY-MM-DD format.");
             const summary = await db_fns.getWfhSummary(toolParams);
             return { wfh_summary: summary };
         }
 
         case "get_wfh_records": {
+            if (toolParams.startDate && !isValidDateString(toolParams.startDate)) throw new Error("Invalid startDate. Please use YYYY-MM-DD format.");
+            if (toolParams.endDate && !isValidDateString(toolParams.endDate)) throw new Error("Invalid endDate. Please use YYYY-MM-DD format.");
+            if (toolParams.limit !== undefined && (!Number.isFinite(Number(toolParams.limit)) || Number(toolParams.limit) < 1)) throw new Error("Invalid limit. Must be a positive number.");
             const records = await db_fns.getAllWfh(toolParams);
             return { wfh_records: records };
         }
@@ -392,6 +475,35 @@ const executeTool = async (toolName, toolParams, session) => {
         case "get_hr_analytics": {
             const analytics = await db_fns.getHrAnalytics();
             return { hr_analytics: analytics };
+        }
+
+        case "get_department_leave_comparison": {
+            const comparison = await db_fns.getDepartmentLeaveStats();
+            return { department_comparison: comparison };
+        }
+
+        case "get_employee_by_id": {
+            const id = Number(toolParams.id);
+            if (!Number.isFinite(id)) throw new Error("Invalid employee ID. Please provide a valid numeric employee ID.");
+            const emp = await db_fns.getById(id);
+            if (!emp) throw new Error(`Employee with ID ${id} not found`);
+            return { employee: emp };
+        }
+
+        case "get_employee_by_name": {
+            const name = String(toolParams.name || "").trim();
+            if (!name) throw new Error("Employee name is required");
+            const emps = await db_fns.getByName(name);
+            return { employees: emps };
+        }
+
+        case "get_all_employees": {
+            const emps = await db_fns.getAllEmployees({
+                department: toolParams.department,
+                is_active: toolParams.is_active,
+                limit: toolParams.limit
+            });
+            return { employees: emps };
         }
 
         case "count_employees": {
@@ -418,6 +530,7 @@ const formatToolResult = (toolName, toolParams, result, session) => {
         if (emps.length > 0) {
             session.context.employeeGroup = emps.map(e => e.name);
             session.context.lastResultType = "employees";
+            if (emps.length === 1) session.context.activeEmployee = emps[0].name;
         }
 
         return {
@@ -430,6 +543,23 @@ const formatToolResult = (toolName, toolParams, result, session) => {
                 columns: ["ID", "Name", "Department", "Status"],
                 rows: emps.map(e => [e.id, e.name, e.department, e.is_active ? "Active" : "Inactive"])
             } : null
+        };
+    }
+
+    if (result.employee !== undefined) {
+        const emp = result.employee;
+        return {
+            message: `**${emp.name}** is an **${emp.department}** employee with status **${emp.is_active ? "Active" : "Inactive"}**.`,
+            structuredData: {
+                type: "card",
+                title: `Employee — ${emp.name}`,
+                data: {
+                    ID: emp.id,
+                    Name: emp.name,
+                    Department: emp.department,
+                    Status: emp.is_active ? "Active" : "Inactive"
+                }
+            }
         };
     }
 
@@ -452,6 +582,9 @@ const formatToolResult = (toolName, toolParams, result, session) => {
         const timeLabel = toolParams.startDate ? ` from ${toolParams.startDate} to ${toolParams.endDate || "today"}` : "";
 
         if (summary.top_employees && summary.top_employees.length > 0 && !toolParams.employee_name) {
+            session.context.employeeGroup = summary.top_employees.map(e => e.employee_name);
+            session.context.lastResultType = "leaves";
+            session.context.lastTopic = "leaves";
             return {
                 message: `Here are the employees ranked by leave days${timeLabel}:`,
                 structuredData: {
@@ -533,6 +666,26 @@ const formatToolResult = (toolName, toolParams, result, session) => {
                 title: `WFH Records${toolParams.employee_name ? ` — ${toolParams.employee_name}` : ""}`,
                 columns: ["ID", "Employee", "Date", "Reason"],
                 rows: records.map(r => [r.id, r.employee_name, String(r.wfh_date).slice(0, 10), r.reason || "N/A"])
+            } : null
+        };
+    }
+
+    if (result.department_comparison !== undefined) {
+        const comparison = result.department_comparison;
+        const departments = (comparison.departments || []).slice().sort((a, b) => b.avg_leave_days_per_employee - a.avg_leave_days_per_employee);
+        const top = departments[0];
+
+        const message = top
+            ? `Across all departments, the **${top.department}** department has the highest average leave usage at **${top.avg_leave_days_per_employee.toFixed(1)} day(s) per employee** — **${top.total_days} total day(s)** across **${top.records_count} record(s)** from **${top.employee_count} employee(s)**.`
+            : "No department-level leave data is available in the database.";
+
+        return {
+            message,
+            structuredData: departments.length ? {
+                type: "table",
+                title: "Department Leave Comparison",
+                columns: ["Department", "Employees", "Leave Records", "Total Days", "Avg Days / Employee"],
+                rows: departments.map(d => [d.department, d.employee_count, d.records_count, `${d.total_days}`, d.avg_leave_days_per_employee.toFixed(1)])
             } : null
         };
     }
@@ -650,9 +803,31 @@ const FALLBACK_MODELS = [
     "gemini-flash-latest",
 ];
 
-const callLLM = async (session, userMessage) => {
-    if (!genAI) return null;
+const MAX_TOOL_ROUNDS = 3;
 
+const getFunctionCallsFromResponse = (response) => {
+    const candidate = response?.candidates?.[0];
+    if (!candidate) return [];
+    const functionCalls = [];
+    for (const part of candidate.content?.parts || []) {
+        if (part.functionCall) {
+            functionCalls.push({ id: part.functionCall.id, name: part.functionCall.name, args: part.functionCall.args || {} });
+        }
+    }
+    return functionCalls;
+};
+
+const getAssistantTextFromResponse = (response) => {
+    const candidate = response?.candidates?.[0];
+    if (!candidate) return null;
+    let text = null;
+    for (const part of candidate.content?.parts || []) {
+        if (part.text) text = part.text;
+    }
+    return text;
+};
+
+const runAgentTurn = async (session, userMessage) => {
     const systemInstruction = buildSystemPrompt(session.context);
     const toolDeclarations = TOOL_SCHEMAS.map(t => ({
         name: t.name,
@@ -680,25 +855,64 @@ const callLLM = async (session, userMessage) => {
                 history: historyForLLM
             });
 
-            const response = await chat.sendMessage({ message: userMessage });
-            const candidate = response.candidates?.[0];
-            if (!candidate) continue;
+            let response = await chat.sendMessage({ message: userMessage });
+            if (!response?.candidates?.[0]) continue;
 
-            const functionCalls = [];
-            let textResponse = null;
+            // Agentic loop: keep feeding tool results back to the LLM until it
+            // answers with text, asks a clarification, or requests a write action.
+            for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+                const functionCalls = getFunctionCallsFromResponse(response);
+                const textResponse = getAssistantTextFromResponse(response);
 
-            for (const part of candidate.content?.parts || []) {
-                if (part.functionCall) {
-                    functionCalls.push({ name: part.functionCall.name, args: part.functionCall.args || {} });
-                } else if (part.text) {
-                    textResponse = part.text;
+                if (functionCalls.length === 0) {
+                    return { text: textResponse, functionCalls: [], pendingProposal: null };
                 }
+
+                const outcomes = [];
+                for (const fc of functionCalls) {
+                    try {
+                        const rawResult = await executeTool(fc.name, fc.args, session);
+
+                        if (rawResult?.__clarification) {
+                            return { text: rawResult.__clarification, clarification: rawResult.__clarification };
+                        }
+
+                        if (rawResult?.__proposal) {
+                            const proposal = await buildWriteProposal(rawResult.__proposal.tool, rawResult.__proposal.params);
+                            if (proposal) {
+                                session.pendingProposal = proposal;
+                                session.history.push({ role: "assistant", content: `Proposed: ${proposal.summary}` });
+                                return {
+                                    text: `I've prepared the following action. Please review and confirm:`,
+                                    requiresConfirmation: true,
+                                    actionProposal: proposal
+                                };
+                            }
+                        }
+
+                        outcomes.push({ name: fc.name, ok: true, result: rawResult });
+                    } catch (err) {
+                        console.error(`[Agent] Tool error (${fc.name}):`, err.message);
+                        outcomes.push({ name: fc.name, ok: false, error: err });
+                    }
+                }
+
+                const functionResponseParts = outcomes.map((outcome, i) => {
+                    const fc = functionCalls[i];
+                    if (outcome.ok) {
+                        return { functionResponse: { name: fc.name, response: outcome.result } };
+                    }
+                    return { functionResponse: { name: fc.name, response: { error: { message: outcome.error.message } } } };
+                });
+
+                response = await chat.sendMessage({ message: { parts: functionResponseParts } });
             }
 
+            const finalText = getAssistantTextFromResponse(response);
             if (model !== GEMINI_MODEL) {
                 console.log(`[LLM] Using fallback model: ${model}`);
             }
-            return { functionCalls, textResponse };
+            return { text: finalText, functionCalls: [], pendingProposal: null };
 
         } catch (err) {
             const is503 = err.message && (err.message.includes("503") || err.message.includes("high demand") || err.message.includes("UNAVAILABLE"));
@@ -716,6 +930,11 @@ const callLLM = async (session, userMessage) => {
 
     console.error("[LLM] All models unavailable — falling back to rule-based engine.");
     return null;
+};
+
+const callLLM = async (session, userMessage) => {
+    if (!genAI) return null;
+    return runAgentTurn(session, userMessage);
 };
 
 // ============================================================
@@ -915,7 +1134,7 @@ const processMessage = async ({ message, sessionId = "default", confirmationActi
     }
 
     // ─────────────────────────────────────────
-    // 3. LLM REASONING LAYER
+    // 3. LLM REASONING LAYER (agentic tool loop with confirmation + clarification handling)
     // ─────────────────────────────────────────
 
     session.history.push({ role: "user", content: text });
@@ -923,65 +1142,27 @@ const processMessage = async ({ message, sessionId = "default", confirmationActi
     const llmResult = await callLLM(session, text);
 
     if (llmResult) {
-        const { functionCalls, textResponse } = llmResult;
+        // The agentic tool loop returns a final answer, a clarification, or a write proposal.
 
-        // LLM responded with plain text (no tool calls)
-        if (!functionCalls || functionCalls.length === 0) {
-            if (textResponse) {
-                session.history.push({ role: "assistant", content: textResponse });
-                return { message: textResponse };
-            }
-        }
-
-        // Process tool calls
-        const responses = [];
-        for (const fc of functionCalls) {
-            try {
-                const rawResult = await executeTool(fc.name, fc.args, session);
-
-                if (rawResult?.__clarification) {
-                    session.history.push({ role: "assistant", content: rawResult.__clarification });
-                    return { message: rawResult.__clarification, needsClarification: true };
-                }
-
-                if (rawResult?.__proposal) {
-                    const proposal = await buildWriteProposal(rawResult.__proposal.tool, rawResult.__proposal.params);
-                    if (proposal) {
-                        session.pendingProposal = proposal;
-                        session.history.push({ role: "assistant", content: `Proposed: ${proposal.summary}` });
-                        return {
-                            message: `I've prepared the following action. Please review and confirm:`,
-                            requiresConfirmation: true,
-                            actionProposal: proposal
-                        };
-                    }
-                }
-
-                const formatted = formatToolResult(fc.name, fc.args, rawResult, session);
-                responses.push(formatted);
-            } catch (err) {
-                console.error(`[Agent] Tool error (${fc.name}):`, err.message);
-                responses.push({ message: `⚠️ Error running ${fc.name}: ${err.message}` });
-            }
-        }
-
-        if (responses.length === 1) {
-            session.history.push({ role: "assistant", content: responses[0].message });
-            return responses[0];
-        }
-
-        if (responses.length > 1) {
-            const combined = {
-                message: responses.map(r => r.message).join("\n\n"),
-                structuredData: responses.find(r => r.structuredData)?.structuredData
+        // Write actions require explicit user confirmation before execution
+        if (llmResult.requiresConfirmation && llmResult.actionProposal) {
+            return {
+                message: llmResult.text || "I've prepared the following action. Please review and confirm:",
+                requiresConfirmation: true,
+                actionProposal: llmResult.actionProposal
             };
-            session.history.push({ role: "assistant", content: combined.message });
-            return combined;
         }
 
-        if (textResponse) {
-            session.history.push({ role: "assistant", content: textResponse });
-            return { message: textResponse };
+        // Ask the user a clarification question when the request is ambiguous
+        if (llmResult.clarification) {
+            session.history.push({ role: "assistant", content: llmResult.clarification });
+            return { message: llmResult.clarification, needsClarification: true };
+        }
+
+        // Final answer produced by the LLM after (optionally) running tools
+        if (llmResult.text) {
+            session.history.push({ role: "assistant", content: llmResult.text });
+            return { message: llmResult.text };
         }
     }
 

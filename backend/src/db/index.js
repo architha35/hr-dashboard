@@ -466,6 +466,39 @@ const getWfhSummary = async (filters = {}) => {
 };
 
 // ==========================================
+// DEPARTMENT LEAVE COMPARISON
+// ==========================================
+
+const getDepartmentLeaveStats = async () => {
+    const leavesQuery = `
+        SELECT
+            COALESCE(e.department, 'Unassigned') AS department,
+            COUNT(DISTINCT e.id)::int AS employee_count,
+            COUNT(l.id)::int AS records_count,
+            COALESCE(SUM(l.no_of_leaves), 0)::numeric AS total_days
+        FROM employees e
+        LEFT JOIN leave_records l ON LOWER(l.employee_name) = LOWER(e.name)
+        GROUP BY COALESCE(e.department, 'Unassigned')
+        ORDER BY total_days DESC, employee_count DESC
+    `;
+
+    const leavesResult = await pool.query(leavesQuery);
+    const departments = leavesResult.rows.map((row) => {
+        const employeeCount = Number(row.employee_count) || 0;
+        const totalDays = Number(row.total_days) || 0;
+        return {
+            department: row.department,
+            employee_count: employeeCount,
+            records_count: Number(row.records_count) || 0,
+            total_days: totalDays,
+            avg_leave_days_per_employee: employeeCount > 0 ? totalDays / employeeCount : 0
+        };
+    });
+
+    return { departments };
+};
+
+// ==========================================
 // HR ANALYTICS OVERVIEW
 // ==========================================
 
@@ -541,6 +574,7 @@ export const db_fns = {
 
     // Analytics & Audit
     getHrAnalytics,
+    getDepartmentLeaveStats,
     createAuditLog,
     pool
 };
