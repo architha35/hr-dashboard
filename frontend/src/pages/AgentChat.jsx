@@ -7,7 +7,7 @@ const AgentChat = () => {
         {
             id: "msg_init",
             role: "assistant",
-            content: "Hello! I am your **Agentic AI HR Assistant**. I can help you search employees, manage leave and work-from-home records, perform organizational analytics, and execute changes with full database verification.\n\nWhat would you like to do today?",
+            content: "Hello! I am your **Agentic AI HR Assistant**.\nWhat would you like to do today?",
             timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
 
         }
@@ -421,12 +421,7 @@ const AgentChat = () => {
                             )}
                         </div>
 
-                        {/* User Avatar */}
-                        {msg.role === "user" && (
-                            <div className="flex h-8 w-8 shrink-0 select-none items-center justify-center rounded-lg bg-blue-600 text-white shadow-xs text-xs font-semibold">
-                                HR
-                            </div>
-                        )}
+                        
                     </div>
                 ))}
 
@@ -481,8 +476,8 @@ const AgentChat = () => {
                     </button>
                 </form>
                 <div className="mt-2 flex items-center justify-between text-[11px] text-gray-400 px-1">
-                    <span>Press Enter to send • Consequential operations require confirmation before database write</span>
-                    <span>Neon PostgreSQL • Allowlisted Tools</span>
+                    <span>Press Enter to send </span>
+                    
                 </div>
             </div>
         </div>
