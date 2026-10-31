@@ -11,7 +11,7 @@ services:
       - key: NODE_ENV
         value: production
       - key: FRONTEND_URL
-        value: https://hr-dashboard-frontend.onrender.com
+        value: https://hr-dashboard-frontend-yn5o.onrender.com
       - key: DATABASE_URL
         sync: false
       - key: GOOGLE_API_KEY
