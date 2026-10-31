@@ -1,6 +1,5 @@
 import { useState, useEffect } from "react";
 import { API_BASE_URL } from "../api/config";
-import { apiFetch } from "../api/request";
 import EmployeeSearchSelect from "../components/EmployeeSearchSelect";
 
 const Leaves = () => {
@@ -16,7 +15,7 @@ const Leaves = () => {
     // Get leaves records
     const getLeaves = async () => {
         try {
-            const response = await apiFetch(`${API_BASE_URL}/leaves`);
+            const response = await fetch(`${API_BASE_URL}/leaves`);
             const data = await response.json();
             setLeaves(Array.isArray(data) ? data : []);
         } catch (err) {
@@ -45,7 +44,7 @@ const Leaves = () => {
 
         setIsSubmitting(true);
         try {
-            const resp = await apiFetch(`${API_BASE_URL}/create/leaves`, {
+            const resp = await fetch(`${API_BASE_URL}/create/leaves`, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",

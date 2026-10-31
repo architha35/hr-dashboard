@@ -1,6 +1,4 @@
-import { useEffect, useState } from "react";
-import { API_BASE_URL } from "./api/config";
-import { login } from "./api/request";
+import { useState } from "react";
 import View from "./pages/View";
 import Create from "./pages/Create";
 import Leaves from "./pages/Xleaves";
@@ -9,72 +7,6 @@ import AgentChat from "./pages/AgentChat";
 
 function App() {
   const [page, setPage] = useState("agent"); // Default to the newly requested AI Agent interface
-  const [authenticated, setAuthenticated] = useState(false);
-  const [authChecked, setAuthChecked] = useState(false);
-  const [password, setPassword] = useState("");
-  const [loginError, setLoginError] = useState("");
-  const [loggingIn, setLoggingIn] = useState(false);
-
-  useEffect(() => {
-    let active = true;
-    const token = sessionStorage.getItem("hr_dashboard_token");
-    if (!token) {
-      setAuthChecked(true);
-    } else {
-      fetch(`${API_BASE_URL}/auth/session`, { headers: { Authorization: `Bearer ${token}` } })
-        .then((response) => {
-          if (active && response.ok) setAuthenticated(true);
-          if (!response.ok) sessionStorage.removeItem("hr_dashboard_token");
-        })
-        .catch(() => sessionStorage.removeItem("hr_dashboard_token"))
-        .finally(() => active && setAuthChecked(true));
-    }
-    const onExpired = () => setAuthenticated(false);
-    window.addEventListener("hr-dashboard-auth-expired", onExpired);
-    return () => {
-      active = false;
-      window.removeEventListener("hr-dashboard-auth-expired", onExpired);
-    };
-  }, []);
-
-  const handleLogin = async (event) => {
-    event.preventDefault();
-    setLoggingIn(true);
-    setLoginError("");
-    try {
-      await login(password);
-      setAuthenticated(true);
-      setPassword("");
-    } catch (error) {
-      setLoginError(error.message);
-    } finally {
-      setLoggingIn(false);
-    }
-  };
-
-  if (!authChecked) {
-    return <main className="min-h-screen grid place-items-center bg-gray-100 text-gray-600">Checking sign-in…</main>;
-  }
-
-  if (!authenticated) {
-    return (
-      <main className="min-h-screen grid place-items-center bg-gray-100 px-4 font-sans text-gray-900">
-        <form onSubmit={handleLogin} className="w-full max-w-sm rounded-2xl border border-gray-200 bg-white p-8 shadow-lg">
-          <div className="mb-6 flex items-center gap-3">
-            <div className="grid h-10 w-10 place-items-center rounded-xl bg-blue-600 font-bold text-white">HR</div>
-            <div>
-              <h1 className="text-xl font-bold">HR PORTAL</h1>
-              <p className="text-sm text-gray-500">Admin sign-in</p>
-            </div>
-          </div>
-          <label htmlFor="admin-password" className="mb-2 block text-sm font-medium">Admin password</label>
-          <input id="admin-password" type="password" autoComplete="current-password" required value={password} onChange={(event) => setPassword(event.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2.5 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100" />
-          {loginError && <p role="alert" className="mt-3 text-sm text-red-600">{loginError}</p>}
-          <button type="submit" disabled={loggingIn} className="mt-5 w-full rounded-lg bg-blue-600 px-4 py-2.5 font-semibold text-white hover:bg-blue-700 disabled:opacity-60">{loggingIn ? "Signing in…" : "Sign in"}</button>
-        </form>
-      </main>
-    );
-  }
 
   return (
     <div className="min-h-screen bg-gray-100 font-sans antialiased text-gray-900">
@@ -104,12 +36,6 @@ function App() {
           >
             <span>✨ AI Agent</span>
             <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-          </button>
-          <button
-            onClick={() => { sessionStorage.removeItem("hr_dashboard_token"); setAuthenticated(false); }}
-            className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-semibold text-gray-600 hover:bg-gray-50"
-          >
-            Sign out
           </button>
         </div>
       </header>

@@ -1,6 +1,5 @@
 import { useState, useRef, useEffect } from "react";
 import { API_BASE_URL } from "../api/config";
-import { apiFetch } from "../api/request";
 
 
 const AgentChat = () => {
@@ -44,7 +43,7 @@ const AgentChat = () => {
         setIsLoading(true);
 
         try {
-            const response = await apiFetch(`${API_BASE_URL}/agent/chat`, {
+            const response = await fetch(`${API_BASE_URL}/agent/chat`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -96,7 +95,7 @@ const AgentChat = () => {
         setIsLoading(true);
 
         try {
-            const response = await apiFetch(`${API_BASE_URL}/agent/chat`, {
+            const response = await fetch(`${API_BASE_URL}/agent/chat`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({

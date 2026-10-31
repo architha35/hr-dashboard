@@ -1,6 +1,5 @@
 import { useState, useEffect } from "react";
 import { API_BASE_URL } from "../api/config";
-import { apiFetch } from "../api/request";
 import EmployeeSearchSelect from "../components/EmployeeSearchSelect";
 
 const WFH = () => {
@@ -15,7 +14,7 @@ const WFH = () => {
     // Get WFH records
     const getwfh = async () => {
         try {
-            const response = await apiFetch(`${API_BASE_URL}/wfh`);
+            const response = await fetch(`${API_BASE_URL}/wfh`);
             const data = await response.json();
             setwfh(Array.isArray(data) ? data : []);
         } catch (error) {
@@ -45,7 +44,7 @@ const WFH = () => {
 
         setIsSubmitting(true);
         try {
-            const response = await apiFetch(`${API_BASE_URL}/create/wfh`, {
+            const response = await fetch(`${API_BASE_URL}/create/wfh`, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",

@@ -1,6 +1,5 @@
 import { useState } from "react";
 import { API_BASE_URL } from "../api/config";
-import { apiFetch } from "../api/request";
 
 const Create = () => {
     const [name, setName] = useState("");
@@ -14,7 +13,7 @@ const Create = () => {
         setIsSubmitting(true);
 
         try {
-            const res = await apiFetch(`${API_BASE_URL}/create/employee`, {
+            const res = await fetch(`${API_BASE_URL}/create/employee`, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
