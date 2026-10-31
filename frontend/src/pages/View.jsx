@@ -72,7 +72,7 @@ const View = () => {
                             type="text"
                             value={searchTerm}
                             onChange={(e) => setSearchTerm(e.target.value)}
-                            placeholder="Search employee by name (e.g. ARCN, Architha)..."
+                            placeholder="Search employee"
                             className="w-full rounded-lg border border-gray-300 py-2.5 pl-10 pr-9 text-sm outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
                         />
                         {/* Search Icon */}

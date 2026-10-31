@@ -1,21 +1,26 @@
+const { GoogleGenAI } = require("@google/genai");
 const { tools } = require("./tools");
 const { db_fns } = require("../db");
 
-// Session store: Map<sessionId, SessionState>
+// ============================================================
+// GEMINI CLIENT SETUP
+// ============================================================
+
+const GEMINI_API_KEY = (process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY || "").replace(/[" ]/g, "");
+const GEMINI_MODEL = "gemini-3-flash-preview";
+
+let genAI = null;
+if (GEMINI_API_KEY) {
+    genAI = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+} else {
+    console.warn("[Agent] GEMINI_API_KEY not set — using rule-based fallback.");
+}
+
+// ============================================================
+// SESSION STORE
+// ============================================================
+
 const sessions = new Map();
-
-// Reference date for date math
-const getToday = () => {
-    const now = new Date();
-    if (now.getFullYear() < 2026) {
-        return new Date("2026-11-01T12:00:00Z");
-    }
-    return now;
-};
-
-const formatDate = (date) => {
-    return date.toISOString().slice(0, 10);
-};
 
 const getSession = (sessionId = "default") => {
     if (!sessions.has(sessionId)) {
@@ -27,6 +32,9 @@ const getSession = (sessionId = "default") => {
                 activeDepartment: null,
                 activeTimeframe: null,
                 lastTopic: null,
+                lastResults: null,
+                lastResultType: null,
+                employeeGroup: null,
             },
             pendingProposal: null,
         });
@@ -34,941 +42,956 @@ const getSession = (sessionId = "default") => {
     return sessions.get(sessionId);
 };
 
-/**
- * Natural Language Date Parsing Helper
- */
+// ============================================================
+// DATE UTILITIES
+// ============================================================
+
+const getToday = () => {
+    const now = new Date();
+    if (now.getFullYear() < 2026) return new Date("2026-11-01T12:00:00Z");
+    return now;
+};
+
+const formatDate = (date) => date.toISOString().slice(0, 10);
+
 const parseTimeframe = (text) => {
     const today = getToday();
-    const currentYear = today.getFullYear();
-    const currentMonth = today.getMonth(); // 0-indexed
+    const Y = today.getFullYear();
+    const M = today.getMonth();
 
-    // "this month"
     if (/this\s+month/i.test(text)) {
-        const start = new Date(Date.UTC(currentYear, currentMonth, 1));
-        const end = new Date(Date.UTC(currentYear, currentMonth + 1, 0));
-        return {
-            label: "this month",
-            startDate: formatDate(start),
-            endDate: formatDate(end),
-        };
+        return { label: "this month", startDate: formatDate(new Date(Date.UTC(Y, M, 1))), endDate: formatDate(new Date(Date.UTC(Y, M + 1, 0))) };
     }
-
-    // "last three months" or "last 3 months"
+    if (/last\s+month/i.test(text)) {
+        return { label: "last month", startDate: formatDate(new Date(Date.UTC(Y, M - 1, 1))), endDate: formatDate(new Date(Date.UTC(Y, M, 0))) };
+    }
     const lastMonthsMatch = text.match(/last\s+(\d+|one|two|three|four|five|six)\s+months?/i);
     if (lastMonthsMatch) {
-        let count = 3;
-        const numStr = lastMonthsMatch[1].toLowerCase();
-        if (numStr === "one" || numStr === "1") count = 1;
-        else if (numStr === "two" || numStr === "2") count = 2;
-        else if (numStr === "three" || numStr === "3") count = 3;
-        else if (numStr === "four" || numStr === "4") count = 4;
-        else if (numStr === "five" || numStr === "5") count = 5;
-        else if (numStr === "six" || numStr === "6") count = 6;
-        else if (parseInt(numStr, 10)) count = parseInt(numStr, 10);
-
-        const start = new Date(Date.UTC(currentYear, currentMonth - count, 1));
-        const end = new Date(Date.UTC(currentYear, currentMonth + 1, 0));
-        return {
-            label: `last ${count} months`,
-            startDate: formatDate(start),
-            endDate: formatDate(end),
-        };
+        const words = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6 };
+        const count = words[lastMonthsMatch[1].toLowerCase()] || parseInt(lastMonthsMatch[1], 10) || 3;
+        return { label: `last ${count} months`, startDate: formatDate(new Date(Date.UTC(Y, M - count, 1))), endDate: formatDate(new Date(Date.UTC(Y, M + 1, 0))) };
     }
-
-    // "this year"
-    if (/this\s+year/i.test(text)) {
-        const start = new Date(Date.UTC(currentYear, 0, 1));
-        const end = new Date(Date.UTC(currentYear, 11, 31));
-        return {
-            label: "this year",
-            startDate: formatDate(start),
-            endDate: formatDate(end),
-        };
-    }
-
-    // "this week"
+    if (/this\s+year/i.test(text)) return { label: "this year", startDate: `${Y}-01-01`, endDate: `${Y}-12-31` };
     if (/this\s+week/i.test(text)) {
-        const dayOfWeek = today.getDay(); // 0 is Sunday
-        const start = new Date(today);
-        start.setDate(today.getDate() - dayOfWeek);
-        const end = new Date(start);
-        end.setDate(start.getDate() + 6);
-        return {
-            label: "this week",
-            startDate: formatDate(start),
-            endDate: formatDate(end),
-        };
+        const dow = today.getDay();
+        const start = new Date(today); start.setDate(today.getDate() - dow);
+        const end = new Date(start); end.setDate(start.getDate() + 6);
+        return { label: "this week", startDate: formatDate(start), endDate: formatDate(end) };
     }
-
-    // Date range: e.g. "from 3rd November to 5th November" or "between 1st and 15th November"
     const rangeMatch = text.match(/(?:from|between)\s+(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+)\s+(?:to|and)\s+(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+)?/i);
     if (rangeMatch) {
-        const d1 = parseInt(rangeMatch[1], 10);
-        const m1 = rangeMatch[2];
-        const d2 = parseInt(rangeMatch[3], 10);
-        const m2 = rangeMatch[4] || m1;
-
-        const parseMonth = (m) => {
-            const months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
-            const idx = months.findIndex((name) => m.toLowerCase().startsWith(name));
-            return idx !== -1 ? idx : currentMonth;
-        };
-
-        const month1 = parseMonth(m1);
-        const month2 = parseMonth(m2);
-
-        const start = new Date(Date.UTC(currentYear, month1, d1));
-        const end = new Date(Date.UTC(currentYear, month2, d2));
-
-        if (!isNaN(start.getTime()) && !isNaN(end.getTime())) {
-            const daysCount = Math.round((end - start) / (1000 * 60 * 60 * 24)) + 1;
-            return {
-                label: `${d1} ${m1} to ${d2} ${m2} ${currentYear}`,
-                startDate: formatDate(start),
-                endDate: formatDate(end),
-                daysCount: Math.max(daysCount, 1),
-            };
+        const months = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
+        const m1 = months.findIndex(n => rangeMatch[2].toLowerCase().startsWith(n));
+        const m2 = rangeMatch[4] ? months.findIndex(n => rangeMatch[4].toLowerCase().startsWith(n)) : m1;
+        const start = new Date(Date.UTC(Y, m1 !== -1 ? m1 : M, parseInt(rangeMatch[1], 10)));
+        const end   = new Date(Date.UTC(Y, m2 !== -1 ? m2 : M, parseInt(rangeMatch[3], 10)));
+        if (!isNaN(start) && !isNaN(end)) {
+            const daysCount = Math.max(Math.round((end - start) / 86400000) + 1, 1);
+            return { label: `${rangeMatch[1]} ${rangeMatch[2]} to ${rangeMatch[3]} ${rangeMatch[4] || rangeMatch[2]} ${Y}`, startDate: formatDate(start), endDate: formatDate(end), daysCount };
         }
     }
-
-    // Single specific date: e.g. "on 5th November" or "on 12th November" or "4th November"
     const singleMatch = text.match(/(?:on\s+)?(\d{1,2})(?:st|nd|rd|th)?\s+(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i);
     if (singleMatch) {
-        const d = parseInt(singleMatch[1], 10);
-        const m = singleMatch[2];
-        const months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
-        const monthIndex = months.findIndex((name) => m.toLowerCase().startsWith(name));
-        if (monthIndex !== -1) {
-            const dateObj = new Date(Date.UTC(currentYear, monthIndex, d));
-            return {
-                label: `${d} ${m} ${currentYear}`,
-                date: formatDate(dateObj),
-                startDate: formatDate(dateObj),
-                endDate: formatDate(dateObj),
-            };
+        const months = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
+        const mi = months.findIndex(n => singleMatch[2].toLowerCase().startsWith(n));
+        if (mi !== -1) {
+            const d = new Date(Date.UTC(Y, mi, parseInt(singleMatch[1], 10)));
+            return { label: `${singleMatch[1]} ${singleMatch[2]} ${Y}`, date: formatDate(d), startDate: formatDate(d), endDate: formatDate(d) };
         }
     }
-
-    // Direct ISO date: YYYY-MM-DD
     const isoMatch = text.match(/\b(\d{4}-\d{2}-\d{2})\b/);
-    if (isoMatch) {
+    if (isoMatch) return { label: isoMatch[1], date: isoMatch[1], startDate: isoMatch[1], endDate: isoMatch[1] };
+    return null;
+};
+
+// ============================================================
+// TOOL SCHEMAS FOR GEMINI FUNCTION CALLING
+// ============================================================
+
+const TOOL_SCHEMAS = [
+    {
+        name: "search_employees",
+        description: "Search for employees by name or department. Use for listing employees, finding employees in a department, or filtering by active status. Returns employee list.",
+        parameters: {
+            type: "object",
+            properties: {
+                query: { type: "string", description: "Search term (name or department substring)" },
+                department: { type: "string", description: "Filter by exact department name" },
+                is_active: { type: "boolean", description: "Filter by active status. Omit for all." },
+                limit: { type: "number", description: "Max results (default 50)" }
+            },
+            required: []
+        }
+    },
+    {
+        name: "get_leave_summary",
+        description: "Get leave statistics: total days, records count, top leave-takers ranked, department breakdown. Use for 'who took most leaves', 'leave totals', 'leave breakdown'.",
+        parameters: {
+            type: "object",
+            properties: {
+                employee_name: { type: "string", description: "Filter by specific employee name" },
+                employee_names: { type: "array", items: { type: "string" }, description: "Filter by a group of employee names (for follow-ups like 'among them')" },
+                startDate: { type: "string", description: "Start date in YYYY-MM-DD format" },
+                endDate: { type: "string", description: "End date in YYYY-MM-DD format" }
+            },
+            required: []
+        }
+    },
+    {
+        name: "get_leave_records",
+        description: "Get individual leave records for an employee or time period.",
+        parameters: {
+            type: "object",
+            properties: {
+                employee_name: { type: "string" },
+                startDate: { type: "string" },
+                endDate: { type: "string" },
+                leave_type: { type: "string" },
+                limit: { type: "number" }
+            },
+            required: []
+        }
+    },
+    {
+        name: "get_wfh_summary",
+        description: "Get WFH statistics: totals, department breakdown, top requesters.",
+        parameters: {
+            type: "object",
+            properties: {
+                employee_name: { type: "string" },
+                startDate: { type: "string" },
+                endDate: { type: "string" }
+            },
+            required: []
+        }
+    },
+    {
+        name: "get_wfh_records",
+        description: "Get individual WFH records for an employee or time period.",
+        parameters: {
+            type: "object",
+            properties: {
+                employee_name: { type: "string" },
+                startDate: { type: "string" },
+                endDate: { type: "string" },
+                limit: { type: "number" }
+            },
+            required: []
+        }
+    },
+    {
+        name: "get_hr_analytics",
+        description: "Get overall HR analytics: total employees, leave days, WFH counts, department breakdown.",
+        parameters: { type: "object", properties: {}, required: [] }
+    },
+    {
+        name: "count_employees",
+        description: "Count employees, optionally filtered by department or active status.",
+        parameters: {
+            type: "object",
+            properties: {
+                department: { type: "string" },
+                is_active: { type: "boolean" }
+            },
+            required: []
+        }
+    },
+    {
+        name: "create_employee",
+        description: "WRITE OPERATION - requires confirmation: Create a new employee. DO NOT execute directly.",
+        parameters: {
+            type: "object",
+            properties: {
+                name: { type: "string", description: "Full name of the employee" },
+                department: { type: "string", description: "Department name" }
+            },
+            required: ["name", "department"]
+        }
+    },
+    {
+        name: "create_leave",
+        description: "WRITE OPERATION - requires confirmation: Create a single-day leave record.",
+        parameters: {
+            type: "object",
+            properties: {
+                employee_name: { type: "string" },
+                leave_date: { type: "string", description: "YYYY-MM-DD" },
+                leave_type: { type: "string", enum: ["FULL_DAY", "HALF_DAY"] },
+                no_of_leaves: { type: "number" }
+            },
+            required: ["employee_name", "leave_date"]
+        }
+    },
+    {
+        name: "create_leave_range",
+        description: "WRITE OPERATION - requires confirmation: Create leave records over a date range.",
+        parameters: {
+            type: "object",
+            properties: {
+                employee_name: { type: "string" },
+                startDate: { type: "string" },
+                endDate: { type: "string" },
+                leave_type: { type: "string", enum: ["FULL_DAY", "HALF_DAY"] }
+            },
+            required: ["employee_name", "startDate", "endDate"]
+        }
+    },
+    {
+        name: "create_wfh",
+        description: "WRITE OPERATION - requires confirmation: Create a WFH request.",
+        parameters: {
+            type: "object",
+            properties: {
+                employee_name: { type: "string" },
+                wfh_date: { type: "string" },
+                reason: { type: "string" }
+            },
+            required: ["employee_name", "wfh_date"]
+        }
+    },
+    {
+        name: "update_employee",
+        description: "WRITE OPERATION - requires confirmation: Update employee department or status. Requires employee ID.",
+        parameters: {
+            type: "object",
+            properties: {
+                id: { type: "number", description: "Employee database ID" },
+                department: { type: "string" },
+                is_active: { type: "boolean" }
+            },
+            required: ["id"]
+        }
+    },
+    {
+        name: "delete_employee",
+        description: "WRITE OPERATION - requires confirmation: Deactivate an employee (soft delete). Requires employee ID.",
+        parameters: {
+            type: "object",
+            properties: {
+                id: { type: "number", description: "Employee database ID" },
+                soft: { type: "boolean" }
+            },
+            required: ["id"]
+        }
+    },
+    {
+        name: "ask_clarification",
+        description: "Ask the user a clarification question when the request is ambiguous.",
+        parameters: {
+            type: "object",
+            properties: {
+                question: { type: "string", description: "The clarification question to ask" }
+            },
+            required: ["question"]
+        }
+    }
+];
+
+const WRITE_TOOLS = new Set(["create_employee", "create_leave", "create_leave_range", "create_wfh", "update_employee", "delete_employee"]);
+
+// ============================================================
+// SYSTEM PROMPT BUILDER
+// ============================================================
+
+const buildSystemPrompt = (context) => {
+    const today = formatDate(getToday());
+    const ctxLines = [
+        context.activeDepartment ? `Active department: ${context.activeDepartment}` : null,
+        context.activeEmployee ? `Active employee: ${context.activeEmployee}` : null,
+        context.activeTimeframe ? `Active timeframe: ${context.activeTimeframe.label} (${context.activeTimeframe.startDate} to ${context.activeTimeframe.endDate})` : null,
+        context.lastTopic ? `Last topic: ${context.lastTopic}` : null,
+        context.employeeGroup ? `Employee group for follow-ups ("them"/"they"/"among them"): [${context.employeeGroup.slice(0, 10).join(", ")}${context.employeeGroup.length > 10 ? ", ..." : ""}]` : null,
+        context.lastResultType ? `Last result type: ${context.lastResultType}` : null,
+    ].filter(Boolean).join("\n");
+
+    return `You are an intelligent HR AI Assistant connected to a live PostgreSQL database.
+Today's date: ${today}.
+${ctxLines ? `\n## Session Context\n${ctxLines}\n` : ""}
+## Core Rules
+1. NEVER fabricate employee names, leave counts, or any data. Always use database tools.
+2. WRITE tools (create_*, update_*, delete_*) must be called as tool calls — they will be intercepted for user confirmation before any DB write.
+3. For follow-ups with pronouns ("them", "they", "among them"), use the employee group from session context above.
+4. For "who took most leaves" without a department/group qualifier, query all employees.
+5. For "who took most among them", use employee_names array parameter with the session group.
+6. For timeframe-only follow-ups like "what about last month?", reuse the previous tool with updated dates.
+7. For ambiguous references, call ask_clarification instead of assuming.
+8. Return structured tool calls — never generate HTML or code in responses.
+
+## Tool Selection Guide
+- List/find employees → search_employees (with department or query params)
+- Count employees → count_employees
+- Leave rankings/totals → get_leave_summary
+- Specific leave records → get_leave_records
+- WFH summary → get_wfh_summary
+- WFH records → get_wfh_records
+- Dashboard/overview → get_hr_analytics
+- Unclear request → ask_clarification`;
+};
+
+// ============================================================
+// TOOL EXECUTOR
+// ============================================================
+
+const executeTool = async (toolName, toolParams, session) => {
+    if (toolName === "ask_clarification") {
+        return { __clarification: toolParams.question };
+    }
+
+    if (WRITE_TOOLS.has(toolName)) {
+        return { __proposal: { tool: toolName, params: toolParams } };
+    }
+
+    switch (toolName) {
+        case "search_employees": {
+            let emps;
+            if (toolParams.department) {
+                emps = await db_fns.getAllEmployees({ department: toolParams.department });
+                if (toolParams.is_active !== undefined) emps = emps.filter(e => e.is_active === toolParams.is_active);
+            } else if (toolParams.query) {
+                emps = await db_fns.searchEmployees(toolParams.query, toolParams.limit || 50);
+                if (toolParams.is_active !== undefined) emps = emps.filter(e => e.is_active === toolParams.is_active);
+            } else {
+                emps = await db_fns.getAllEmployees({ is_active: toolParams.is_active, limit: toolParams.limit || 50 });
+            }
+            return { employees: emps };
+        }
+
+        case "get_leave_summary": {
+            if (toolParams.employee_names && toolParams.employee_names.length > 0) {
+                const results = await Promise.all(
+                    toolParams.employee_names.map(name =>
+                        db_fns.getLeaveSummary({ employee_name: name, startDate: toolParams.startDate, endDate: toolParams.endDate })
+                    )
+                );
+                const merged = toolParams.employee_names.map((name, i) => ({
+                    employee_name: name,
+                    total_days: results[i].total_days,
+                    records_count: results[i].total_records
+                })).sort((a, b) => b.total_days - a.total_days);
+                return { leave_summary: { top_employees: merged, total_days: merged.reduce((s, e) => s + e.total_days, 0), total_records: merged.reduce((s, e) => s + e.records_count, 0), unique_employees: merged.length } };
+            }
+            const summary = await db_fns.getLeaveSummary({ employee_name: toolParams.employee_name, startDate: toolParams.startDate, endDate: toolParams.endDate });
+            return { leave_summary: summary };
+        }
+
+        case "get_leave_records": {
+            const records = await db_fns.getAllLeaves(toolParams);
+            return { leave_records: records };
+        }
+
+        case "get_wfh_summary": {
+            const summary = await db_fns.getWfhSummary(toolParams);
+            return { wfh_summary: summary };
+        }
+
+        case "get_wfh_records": {
+            const records = await db_fns.getAllWfh(toolParams);
+            return { wfh_records: records };
+        }
+
+        case "get_hr_analytics": {
+            const analytics = await db_fns.getHrAnalytics();
+            return { hr_analytics: analytics };
+        }
+
+        case "count_employees": {
+            const count = await db_fns.countEmployees(toolParams);
+            return { count, params: toolParams };
+        }
+
+        default:
+            throw new Error(`Unknown tool: ${toolName}`);
+    }
+};
+
+// ============================================================
+// FORMAT TOOL RESULTS
+// ============================================================
+
+const formatToolResult = (toolName, toolParams, result, session) => {
+    if (result.employees !== undefined) {
+        const emps = result.employees;
+        const deptLabel = toolParams.department || (emps.length > 0 && emps.every(e => e.department === emps[0].department) ? emps[0].department : null);
+        const statusLabel = toolParams.is_active === true ? "active " : toolParams.is_active === false ? "inactive " : "";
+
+        if (deptLabel) session.context.activeDepartment = deptLabel;
+        if (emps.length > 0) {
+            session.context.employeeGroup = emps.map(e => e.name);
+            session.context.lastResultType = "employees";
+        }
+
         return {
-            label: isoMatch[1],
-            date: isoMatch[1],
-            startDate: isoMatch[1],
-            endDate: isoMatch[1],
+            message: emps.length === 0
+                ? `No ${statusLabel}employees found${deptLabel ? ` in the **${deptLabel}** department` : ""}.`
+                : `Found **${emps.length} ${statusLabel}employee(s)**${deptLabel ? ` in the **${deptLabel}** department` : ""}:`,
+            structuredData: emps.length ? {
+                type: "table",
+                title: deptLabel ? `Employees in ${deptLabel}` : "Employee Results",
+                columns: ["ID", "Name", "Department", "Status"],
+                rows: emps.map(e => [e.id, e.name, e.department, e.is_active ? "Active" : "Inactive"])
+            } : null
         };
     }
 
-    return null;
-};
-
-/**
- * Extract Employee Name from text
- */
-const extractEmployeeName = async (text, sessionContext) => {
-    // If text explicitly targets all employees, do not bind to specific employee
-    if (/all\s+employees|by\s+all|all\s+staff|everyone|every\s+employee/i.test(text)) {
-        return null;
+    if (result.count !== undefined) {
+        const p = result.params || toolParams;
+        return {
+            message: `There are **${result.count} employee(s)**${p.department ? ` in the **${p.department}** department` : ""}${p.is_active === true ? " that are currently **active**" : p.is_active === false ? " that are **inactive**" : ""}.`,
+            structuredData: {
+                type: "card",
+                title: "Employee Count",
+                data: { Count: result.count, ...(p.department ? { Department: p.department } : {}), ...(p.is_active !== undefined ? { Status: p.is_active ? "Active" : "Inactive" } : {}) }
+            }
+        };
     }
 
-    // Check for ID references first
-    const idMatch = text.match(/(?:employee\s+id|record\s+id|id)\s*[:#]?\s*(\d+)/i);
-    if (idMatch) {
-        const id = idMatch[1];
-        const emp = await db_fns.getById(id);
-        if (emp) return emp.name;
-    }
+    if (result.leave_summary !== undefined) {
+        const summary = result.leave_summary;
+        session.context.lastResultType = "leaves";
+        session.context.lastTopic = "leaves";
+        const timeLabel = toolParams.startDate ? ` from ${toolParams.startDate} to ${toolParams.endDate || "today"}` : "";
 
-    const stopWords = new Set([
-        "create", "leaves", "leave", "wfh", "home", "work", "from", "for", "to", "on", "in",
-        "update", "delete", "department", "show", "give", "how", "many", "all", "the", "an",
-        "employee", "new", "record", "request", "requests", "total", "submitted", "taken",
-        "last", "this", "month", "year", "week", "three", "two", "one", "engineering", "sde",
-        "details", "information", "what", "about"
-    ]);
-
-    // Check against existing employees in database
-    const allEmployees = await db_fns.getAllEmployees();
-    for (const emp of allEmployees) {
-        const regex = new RegExp(`\\b${emp.name}\\b`, "i");
-        if (regex.test(text)) {
-            return emp.name;
-        }
-    }
-
-    // Patterns like "for <Name>", "named <Name>", "of <Name>", "change <Name>'s", "update <Name>'s", "delete <Name>'s"
-    const nameMatch = text.match(/(?:for|named|about|change|update|delete|remove)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i);
-    if (nameMatch) {
-        const candidate = nameMatch[1].trim();
-        if (!stopWords.has(candidate.toLowerCase())) {
-            return candidate;
-        }
-    }
-
-    // Context carryover: check if user asks follow-up about previous employee
-    if (sessionContext && sessionContext.activeEmployee) {
-        if (/(?:he|she|they|him|her|this\s+employee|the\s+same|what\s+about|how\s+about|and\s+wfh|and\s+leaves)/i.test(text)) {
-            return sessionContext.activeEmployee;
-        }
-    }
-
-    return null;
-};
-
-/**
- * Extract Department from text
- */
-const extractDepartment = (text) => {
-    const depts = [
-        "AI and ML", "Artificial Intelligence", "Machine Learning",
-        "Engineering", "Software Engineering", "SDE",
-        "Product Management", "Product Manager", "Business Development",
-        "Human Resources", "HR", "Sales", "Marketing", "Finance", "Operations", "aaa", "abc"
-    ];
-
-    for (const dept of depts) {
-        const reg = new RegExp(`\\b${dept}\\b`, "i");
-        if (reg.test(text)) {
-            return dept;
-        }
-    }
-
-    const deptMatch = text.match(/(?:department(?:\s+to)?|in\s+(?:the\s+)?)\s*[:]?\s*([A-Za-z0-9\s&]+?)(?:\s+department|\.|$)/i);
-    if (deptMatch) {
-        const candidate = deptMatch[1].trim();
-        if (candidate.length > 1 && !/^(all|this|the|an|a|new|which)$/i.test(candidate)) {
-            return candidate;
-        }
-    }
-
-    return null;
-};
-
-/**
- * Main Message Processing Function
- */
-const processMessage = async ({ message, sessionId = "default", confirmationAction = null }) => {
-    const session = getSession(sessionId);
-    const text = (message || "").trim();
-
-    // ==========================================
-    // 1. CONFIRMATION & CANCELLATION WORKFLOW
-    // ==========================================
-
-    // Handle structured confirmation action (e.g. from UI buttons)
-    if (confirmationAction) {
-        const { actionId, confirmed } = confirmationAction;
-        const proposal = session.pendingProposal;
-
-        if (!proposal || proposal.id !== actionId) {
+        if (summary.top_employees && summary.top_employees.length > 0 && !toolParams.employee_name) {
             return {
-                message: "No matching pending action found or the action has expired.",
-                status: "EXPIRED"
+                message: `Here are the employees ranked by leave days${timeLabel}:`,
+                structuredData: {
+                    type: "table",
+                    title: `Leave Rankings${timeLabel}`,
+                    columns: ["Employee", "Total Days", "Records"],
+                    rows: summary.top_employees.map(e => [e.employee_name, `${e.total_days} day(s)`, `${e.records_count} record(s)`])
+                }
             };
         }
 
-        session.pendingProposal = null; // Clear proposal
-
-        if (!confirmed) {
+        if (toolParams.employee_name) {
             return {
-                message: `Action cancelled: ${proposal.summary}. No changes were made to the database.`,
-                status: "CANCELLED",
-                actionProposal: null
-            };
-        }
-
-        // Execute confirmed action
-        try {
-            const toolFn = tools[proposal.tool];
-            if (!toolFn) throw new Error(`Unknown tool: ${proposal.tool}`);
-
-            const result = await toolFn(proposal.params);
-
-            return {
-                message: `✅ Successfully executed: ${proposal.summary}`,
-                status: "COMPLETED",
-                actionResult: {
-                    type: proposal.type,
-                    data: result
-                },
+                message: `**${toolParams.employee_name}** has taken **${summary.total_days} leave day(s)** across **${summary.total_records} record(s)**${timeLabel}.`,
                 structuredData: {
                     type: "card",
-                    title: "Operation Completed",
-                    data: result
-                }
-            };
-        } catch (err) {
-            console.error("Error executing confirmed action:", err);
-            return {
-                message: `❌ Failed to execute action: ${err.message}`,
-                status: "FAILED",
-                error: err.message
-            };
-        }
-    }
-
-    // Handle text-based confirmation if there is an active pending proposal
-    if (session.pendingProposal) {
-        const isConfirm = /\b(yes|confirm|proceed|ok|okay|sure|go ahead|do it|execute|agree|accepted)\b/i.test(text);
-        const isCancel = /\b(no|cancel|abort|stop|don't|dont|nevermind|reject)\b/i.test(text);
-
-        if (isConfirm && !isCancel) {
-            return await processMessage({
-                sessionId,
-                confirmationAction: { actionId: session.pendingProposal.id, confirmed: true }
-            });
-        } else if (isCancel) {
-            return await processMessage({
-                sessionId,
-                confirmationAction: { actionId: session.pendingProposal.id, confirmed: false }
-            });
-        }
-    }
-
-    // ==========================================
-    // 2. INTENT RECOGNITION & ROUTING
-    // ==========================================
-
-    const lower = text.toLowerCase();
-    const timeframe = parseTimeframe(text) || session.context.activeTimeframe;
-    const employeeName = await extractEmployeeName(text, session.context);
-    const department = extractDepartment(text);
-
-    // Update active context if detected
-    if (employeeName) session.context.activeEmployee = employeeName;
-    if (department) session.context.activeDepartment = department;
-    if (timeframe) session.context.activeTimeframe = timeframe;
-
-    // ------------------------------------------
-    // A. CREATE LEAVE INTENT
-    // e.g., "Create leaves for Rohit from 3rd November to 5th November."
-    // ------------------------------------------
-    if (/(?:create|apply|add|book|request)\s+(?:a\s+)?leave/i.test(lower) ||
-        (/leave/i.test(lower) && /(?:from|for|on)\s+[A-Za-z0-9]+/i.test(lower) && /(?:create|add)/i.test(lower))) {
-
-        if (!employeeName) {
-            return {
-                message: "Which employee should I create leaves for? Please specify their name.",
-                needsClarification: true
-            };
-        }
-
-        const tf = parseTimeframe(text);
-        if (!tf || (!tf.date && !tf.startDate)) {
-            return {
-                message: `What date or date range should the leave be for ${employeeName}? (e.g. from 3rd November to 5th November, or on 10th November)`,
-                needsClarification: true
-            };
-        }
-
-        const isHalfDay = /half(?:\s*|-)?day/i.test(lower);
-        const leaveType = isHalfDay ? "HALF_DAY" : "FULL_DAY";
-        const days = tf.daysCount || (isHalfDay ? 0.5 : 1);
-
-        const startDate = tf.startDate || tf.date;
-        const endDate = tf.endDate || tf.date;
-
-        const proposal = {
-            id: `act_${Date.now()}`,
-            type: "CREATE_LEAVE",
-            tool: startDate === endDate ? "create_leave" : "create_leave_range",
-            params: startDate === endDate ? {
-                employee_name: employeeName,
-                leave_date: startDate,
-                leave_type: leaveType,
-                no_of_leaves: days
-            } : {
-                employee_name: employeeName,
-                startDate,
-                endDate,
-                leave_type: leaveType,
-                no_of_leaves_per_day: 1
-            },
-            title: "Create Leave Request",
-            summary: `Create ${days} day(s) of ${leaveType} leave for ${employeeName} (${startDate === endDate ? startDate : `${startDate} to ${endDate}`})`,
-            details: {
-                Employee: employeeName,
-                "Start Date": startDate,
-                "End Date": endDate,
-                "Leave Type": leaveType,
-                "Total Days": days
-            }
-        };
-
-        session.pendingProposal = proposal;
-
-        return {
-            message: `I've prepared the leave request for **${employeeName}**. Please confirm to proceed:`,
-            requiresConfirmation: true,
-            actionProposal: proposal
-        };
-    }
-
-    // ------------------------------------------
-    // B. CREATE WFH INTENT
-    // e.g., "Create a WFH request for Rohit on 5th November."
-    // ------------------------------------------
-    if (/(?:create|apply|add|request)\s+(?:a\s+)?(?:wfh|work[-\s]+from[-\s]+home)/i.test(lower)) {
-        if (!employeeName) {
-            return {
-                message: "Which employee would like to request Work From Home? Please specify their name.",
-                needsClarification: true
-            };
-        }
-
-        const tf = parseTimeframe(text);
-        const wfhDate = tf?.date || tf?.startDate;
-
-        if (!wfhDate) {
-            return {
-                message: `What date should the WFH request be for ${employeeName}? (e.g. on 5th November)`,
-                needsClarification: true
-            };
-        }
-
-        let reason = "Remote work";
-        const reasonMatch = text.match(/(?:reason|for|because)\s*[:]?\s*(?:of\s+)?([A-Za-z0-9\s,]+?)(?:\s+on|\.|$)/i);
-        if (reasonMatch && !/^(5th|november|wfh|employee)$/i.test(reasonMatch[1].trim())) {
-            reason = reasonMatch[1].trim();
-        }
-
-        const proposal = {
-            id: `act_${Date.now()}`,
-            type: "CREATE_WFH",
-            tool: "create_wfh",
-            params: {
-                employee_name: employeeName,
-                wfh_date: wfhDate,
-                reason
-            },
-            title: "Create Work From Home Request",
-            summary: `Create WFH request for ${employeeName} on ${wfhDate} (Reason: ${reason})`,
-            details: {
-                Employee: employeeName,
-                Date: wfhDate,
-                Reason: reason
-            }
-        };
-
-        session.pendingProposal = proposal;
-
-        return {
-            message: `I've prepared the Work From Home request for **${employeeName}**. Please confirm to submit:`,
-            requiresConfirmation: true,
-            actionProposal: proposal
-        };
-    }
-
-    // ------------------------------------------
-    // C. CREATE EMPLOYEE INTENT
-    // e.g., "Create a new employee named Rohit in the AI and ML department."
-    // ------------------------------------------
-    if (/(?:create|add|register|hire)\s+(?:a\s+)?(?:new\s+)?employee/i.test(lower)) {
-        if (!employeeName) {
-            return {
-                message: "What is the name of the new employee? (e.g. 'Create a new employee named Rohit in Engineering')",
-                needsClarification: true
-            };
-        }
-
-        if (!department) {
-            return {
-                message: `Which department should ${employeeName} be assigned to?`,
-                needsClarification: true
-            };
-        }
-
-        const proposal = {
-            id: `act_${Date.now()}`,
-            type: "CREATE_EMPLOYEE",
-            tool: "create_employee",
-            params: {
-                name: employeeName,
-                department,
-                is_active: true
-            },
-            title: "Add New Employee",
-            summary: `Add ${employeeName} to the ${department} department`,
-            details: {
-                Name: employeeName,
-                Department: department,
-                Status: "Active"
-            }
-        };
-
-        session.pendingProposal = proposal;
-
-        return {
-            message: `I've prepared the registration for new employee **${employeeName}**. Please confirm to add:`,
-            requiresConfirmation: true,
-            actionProposal: proposal
-        };
-    }
-
-    // ------------------------------------------
-    // D. UPDATE EMPLOYEE INTENT
-    // e.g., "Update Rohit's department to AI and ML." or "Change Rohit’s department to AI and ML."
-    // ------------------------------------------
-    if (/(?:update|change|modify)\s+(?:employee|department|[A-Za-z]+'s\s+department)/i.test(lower)) {
-        const idMatch = text.match(/(?:employee\s+id|id)\s*[:#]?\s*(\d+)/i);
-        let emp = null;
-
-        if (idMatch) {
-            emp = await db_fns.getById(idMatch[1]);
-        } else if (employeeName) {
-            const matches = await db_fns.getByName(employeeName);
-            if (matches.length === 1) {
-                emp = matches[0];
-            } else if (matches.length > 1) {
-                return {
-                    message: `Found multiple employees named '${employeeName}'. Please specify by ID:\n` +
-                        matches.map((m) => `• ID ${m.id} (${m.name} - ${m.department})`).join("\n"),
-                    needsClarification: true
-                };
-            }
-        }
-
-        if (!emp) {
-            return {
-                message: "Which employee would you like to update? Please provide their name or ID.",
-                needsClarification: true
-            };
-        }
-
-        if (!department) {
-            return {
-                message: `What should ${emp.name}'s new department be?`,
-                needsClarification: true
-            };
-        }
-
-        const proposal = {
-            id: `act_${Date.now()}`,
-            type: "UPDATE_EMPLOYEE",
-            tool: "update_employee",
-            params: {
-                id: emp.id,
-                department
-            },
-            title: "Update Employee Department",
-            summary: `Change department of ${emp.name} (ID: ${emp.id}) from "${emp.department}" to "${department}"`,
-            details: {
-                "Employee ID": emp.id,
-                Name: emp.name,
-                "Current Department": emp.department,
-                "New Department": department
-            }
-        };
-
-        session.pendingProposal = proposal;
-
-        return {
-            message: `Please confirm updating the department for **${emp.name}**:`,
-            requiresConfirmation: true,
-            actionProposal: proposal
-        };
-    }
-
-    // ------------------------------------------
-    // E. DELETE EMPLOYEE INTENT
-    // e.g., "Delete the employee record for Rohit." or "Delete employee ID 125."
-    // ------------------------------------------
-    if (/(?:delete|remove|deactivate)\s+(?:the\s+)?(?:employee|record)/i.test(lower)) {
-        const idMatch = text.match(/(?:employee\s+id|id)\s*[:#]?\s*(\d+)/i);
-        let emp = null;
-
-        if (idMatch) {
-            emp = await db_fns.getById(idMatch[1]);
-        } else if (employeeName) {
-            const matches = await db_fns.getByName(employeeName);
-            if (matches.length === 1) {
-                emp = matches[0];
-            } else if (matches.length > 1) {
-                return {
-                    message: `Found multiple employees named '${employeeName}'. Please specify the ID to delete:\n` +
-                        matches.map((m) => `• ID ${m.id} (${m.name} - ${m.department})`).join("\n"),
-                    needsClarification: true
-                };
-            }
-        }
-
-        if (!emp) {
-            return {
-                message: "Which employee record would you like to delete? Please provide their name or ID.",
-                needsClarification: true
-            };
-        }
-
-        const associatedLeaves = await db_fns.getAllLeaves({ employee_name: emp.name });
-        const associatedWfh = await db_fns.getAllWfh({ employee_name: emp.name });
-
-        const proposal = {
-            id: `act_${Date.now()}`,
-            type: "DELETE_EMPLOYEE",
-            tool: "delete_employee",
-            params: {
-                id: emp.id,
-                soft: true
-            },
-            title: "Deactivate Employee Record",
-            summary: `Deactivate employee ${emp.name} (ID: ${emp.id}) in ${emp.department}`,
-            warning: associatedLeaves.length || associatedWfh.length
-                ? `Note: ${emp.name} has ${associatedLeaves.length} leave record(s) and ${associatedWfh.length} WFH request(s). Soft deactivation preserves audit trail.`
-                : undefined,
-            details: {
-                "Employee ID": emp.id,
-                Name: emp.name,
-                Department: emp.department,
-                "Associated Leaves": associatedLeaves.length,
-                "Associated WFH": associatedWfh.length,
-                Action: "Deactivate (Soft Delete)"
-            }
-        };
-
-        session.pendingProposal = proposal;
-
-        return {
-            message: `⚠️ **Warning**: You are requesting to remove **${emp.name}** (ID: ${emp.id}). Please review and confirm:`,
-            requiresConfirmation: true,
-            actionProposal: proposal
-        };
-    }
-
-    // ------------------------------------------
-    // F. WORK FROM HOME RETRIEVAL & ANALYTICS
-    // e.g., "Give me the total number of work-from-home requests submitted by all employees this month."
-    // Follow up: "What about work-from-home requests?"
-    // ------------------------------------------
-    if (/(?:wfh|work[-\s]+from[-\s]+home)/i.test(lower) && !/(?:create|add|apply|request)\s+(?:a\s+)?(?:wfh|work)/i.test(lower)) {
-        session.context.lastTopic = "wfh";
-
-        // Department breakdown
-        if (/(?:by|each|per)\s+department/i.test(lower)) {
-            const summary = await db_fns.getWfhSummary({
-                startDate: timeframe?.startDate,
-                endDate: timeframe?.endDate
-            });
-
-            return {
-                message: `Here is the WFH request count by department ${timeframe ? `for **${timeframe.label}**` : ""}:`,
-                structuredData: {
-                    type: "table",
-                    title: "WFH Requests by Department",
-                    columns: ["Department", "Total WFH Requests"],
-                    rows: summary.department_breakdown.map((d) => [d.department, d.total_requests])
+                    title: `Leave Summary — ${toolParams.employee_name}`,
+                    data: { "Total Days": summary.total_days, "Total Records": summary.total_records, ...(timeLabel ? { Period: timeLabel } : {}) }
                 }
             };
         }
 
-        // Specific employee WFH history
-        if (employeeName) {
-            const summary = await db_fns.getWfhSummary({
-                employee_name: employeeName,
-                startDate: timeframe?.startDate,
-                endDate: timeframe?.endDate
-            });
-
-            const records = await db_fns.getAllWfh({
-                employee_name: employeeName,
-                startDate: timeframe?.startDate,
-                endDate: timeframe?.endDate,
-                limit: 10
-            });
-
-            const tfLabel = timeframe ? ` in the ${timeframe.label}` : " in total";
-
-            return {
-                message: `**${employeeName}** has submitted **${summary.total_records} Work From Home request(s)**${tfLabel}.`,
-                structuredData: records.length ? {
-                    type: "table",
-                    title: `WFH Records for ${employeeName}`,
-                    columns: ["ID", "WFH Date", "Reason"],
-                    rows: records.map((r) => [r.id, String(r.wfh_date).slice(0, 10), r.reason || "N/A"])
-                } : null
-            };
-        }
-
-        // Total WFH requests submitted by all employees
-        const tf = parseTimeframe(text) || {
-            startDate: `${getToday().getFullYear()}-${String(getToday().getMonth() + 1).padStart(2, "0")}-01`,
-            label: "this month"
-        };
-
-        const summary = await db_fns.getWfhSummary({
-            startDate: tf.startDate,
-            endDate: tf.endDate
-        });
-
-        const topRequester = summary.top_employees[0]
-            ? `${summary.top_employees[0].employee_name} (${summary.top_employees[0].total_requests})`
-            : "None";
-
         return {
-            message: `Total Work-From-Home requests submitted by all employees **${tf.label}**: **${summary.total_records}** across **${summary.unique_employees} employee(s)**.`,
+            message: `Leave overview${timeLabel}: **${summary.total_records} records**, **${summary.total_days} total days** across **${summary.unique_employees} employee(s)**.`,
             structuredData: {
                 type: "metrics",
-                title: `WFH Summary (${tf.label})`,
+                title: `Leave Summary${timeLabel}`,
                 metrics: [
-                    { label: "Total WFH Records", value: summary.total_records },
-                    { label: "Employees Requesting", value: summary.unique_employees },
-                    { label: "Top Requester", value: topRequester },
-                    { label: "Period", value: tf.label }
-                ]
-            }
-        };
-    }
-
-    // ------------------------------------------
-    // G. LEAVE RETRIEVAL & ANALYTICS
-    // e.g., "How many leaves has Rohit taken in the last three months?"
-    // "Show me the employees who have applied for the most leaves this year."
-    // ------------------------------------------
-    if (/leave/i.test(lower) && !/(?:create|add|apply|book)/i.test(lower)) {
-        session.context.lastTopic = "leaves";
-
-        // Query top requesters
-        if (/(?:most|highest|top)\s+leaves/i.test(lower)) {
-            const tf = parseTimeframe(text) || { startDate: `${getToday().getFullYear()}-01-01`, label: "this year" };
-            const summary = await db_fns.getLeaveSummary({ startDate: tf.startDate, endDate: tf.endDate });
-
-            return {
-                message: `Here are the employees who applied for the most leaves during **${tf.label || "the period"}**:`,
-                structuredData: {
-                    type: "table",
-                    title: `Top Leave Requesters (${tf.label || "Overall"})`,
-                    columns: ["Employee Name", "Total Days", "Records Count"],
-                    rows: summary.top_employees.map((e) => [
-                        e.employee_name,
-                        `${e.total_days} day(s)`,
-                        `${e.records_count} record(s)`
-                    ])
-                }
-            };
-        }
-
-        // Query department totals
-        if (/(?:by|each|per)\s+department/i.test(lower) || /department(?:'s)?\s+(?:total|breakdown)/i.test(lower)) {
-            const summary = await db_fns.getLeaveSummary({
-                startDate: timeframe?.startDate,
-                endDate: timeframe?.endDate
-            });
-
-            return {
-                message: `Here is the total leave breakdown by department ${timeframe ? `for **${timeframe.label}**` : ""}:`,
-                structuredData: {
-                    type: "table",
-                    title: "Leave Days by Department",
-                    columns: ["Department", "Total Days", "Total Requests"],
-                    rows: summary.department_breakdown.map((d) => [
-                        d.department,
-                        `${d.total_days} day(s)`,
-                        `${d.records_count} record(s)`
-                    ])
-                }
-            };
-        }
-
-        // Specific employee leave count / history
-        if (employeeName) {
-            const summary = await db_fns.getLeaveSummary({
-                employee_name: employeeName,
-                startDate: timeframe?.startDate,
-                endDate: timeframe?.endDate
-            });
-
-            const records = await db_fns.getAllLeaves({
-                employee_name: employeeName,
-                startDate: timeframe?.startDate,
-                endDate: timeframe?.endDate,
-                limit: 10
-            });
-
-            const tfLabel = timeframe ? ` in the ${timeframe.label}` : " in total";
-
-            return {
-                message: `**${employeeName}** has taken a total of **${summary.total_days} leave day(s)** across **${summary.total_records} record(s)**${tfLabel}.`,
-                structuredData: records.length ? {
-                    type: "table",
-                    title: `Leave Records for ${employeeName}`,
-                    columns: ["ID", "Leave Date", "Type", "Days"],
-                    rows: records.map((r) => [
-                        r.id,
-                        String(r.leave_date).slice(0, 10),
-                        r.leave_type || "FULL_DAY",
-                        r.no_of_leaves
-                    ])
-                } : null
-            };
-        }
-
-        // General leave records or count
-        const summary = await db_fns.getLeaveSummary({
-            startDate: timeframe?.startDate,
-            endDate: timeframe?.endDate
-        });
-
-        return {
-            message: `There are **${summary.total_records} leave records** (${summary.total_days} total leave days) taken by **${summary.unique_employees} employee(s)** ${timeframe ? `in ${timeframe.label}` : "overall"}.`,
-            structuredData: {
-                type: "metrics",
-                title: `Leave Summary (${timeframe ? timeframe.label : "All Time"})`,
-                metrics: [
-                    { label: "Total Leave Records", value: summary.total_records },
-                    { label: "Total Leave Days", value: summary.total_days },
+                    { label: "Total Records", value: summary.total_records },
+                    { label: "Total Days", value: summary.total_days },
                     { label: "Employees on Leave", value: summary.unique_employees }
                 ]
             }
         };
     }
 
-    // ------------------------------------------
-    // H. EMPLOYEE RETRIEVAL & LISTING
-    // e.g., "Show me all employees in the Engineering department."
-    // "Find employee Rohit."
-    // "How many active employees do we have?"
-    // ------------------------------------------
-    if (/(?:show|find|list|get|display|search|who)\s+.*(?:employee|all|engineering|team)/i.test(lower) ||
-        (/employee/i.test(lower) && !/(?:leave|wfh)/i.test(lower))) {
-
-        // Count query: "How many active employees do we have?"
-        if (/how\s+many\s+active\s+employees/i.test(lower)) {
-            const count = await db_fns.countEmployees({ is_active: true });
-            return {
-                message: `We currently have **${count} active employee(s)** registered in the organization.`,
-                structuredData: {
-                    type: "card",
-                    title: "Active Employees",
-                    data: { "Total Active Employees": count }
-                }
-            };
-        }
-
-        // By department: "Show me all employees in the Engineering department."
-        if (department) {
-            const employees = await db_fns.getAllEmployees({ department });
-            return {
-                message: `Found **${employees.length} employee(s)** in the **${department}** department:`,
-                structuredData: {
-                    type: "table",
-                    title: `Employees in ${department}`,
-                    columns: ["ID", "Name", "Department", "Status"],
-                    rows: employees.map((e) => [
-                        e.id,
-                        e.name,
-                        e.department,
-                        e.is_active ? "Active" : "Inactive"
-                    ])
-                }
-            };
-        }
-
-        // By ID: "Show me the details of employee ID 125."
-        const idMatch = text.match(/(?:employee\s+id|id)\s*[:#]?\s*(\d+)/i);
-        if (idMatch) {
-            const emp = await db_fns.getById(idMatch[1]);
-            if (!emp) {
-                return {
-                    message: `No employee found with ID **${idMatch[1]}**.`
-                };
-            }
-            return {
-                message: `Details for employee **${emp.name}** (ID: ${emp.id}):`,
-                structuredData: {
-                    type: "card",
-                    title: `Employee Profile — ${emp.name}`,
-                    data: {
-                        ID: emp.id,
-                        Name: emp.name,
-                        Department: emp.department,
-                        Status: emp.is_active ? "Active" : "Inactive",
-                        "Created At": String(emp.created_at).slice(0, 10)
-                    }
-                }
-            };
-        }
-
-        // By name search: "Find employee Rohit."
-        if (employeeName) {
-            const matches = await db_fns.searchEmployees(employeeName);
-            if (!matches.length) {
-                return {
-                    message: `No employee found matching "${employeeName}".`
-                };
-            }
-            return {
-                message: `Found **${matches.length} matching employee(s)** for "${employeeName}":`,
-                structuredData: {
-                    type: "table",
-                    title: `Search Results for "${employeeName}"`,
-                    columns: ["ID", "Name", "Department", "Status"],
-                    rows: matches.map((e) => [
-                        e.id,
-                        e.name,
-                        e.department,
-                        e.is_active ? "Active" : "Inactive"
-                    ])
-                }
-            };
-        }
-
-        // Default: Show all employees (limited to 50 for performance)
-        const employees = await db_fns.getAllEmployees({ limit: 50 });
+    if (result.leave_records !== undefined) {
+        const records = result.leave_records;
+        session.context.lastResultType = "leaves";
         return {
-            message: `Here are the employees in your organization (${employees.length} shown):`,
-            structuredData: {
+            message: `Found **${records.length} leave record(s)**${toolParams.employee_name ? ` for **${toolParams.employee_name}**` : ""}:`,
+            structuredData: records.length ? {
                 type: "table",
-                title: "Employees Directory",
-                columns: ["ID", "Name", "Department", "Status"],
-                rows: employees.map((e) => [
-                    e.id,
-                    e.name,
-                    e.department,
-                    e.is_active ? "Active" : "Inactive"
-                ])
-            }
+                title: `Leave Records${toolParams.employee_name ? ` — ${toolParams.employee_name}` : ""}`,
+                columns: ["ID", "Employee", "Date", "Type", "Days"],
+                rows: records.map(r => [r.id, r.employee_name, String(r.leave_date).slice(0, 10), r.leave_type, r.no_of_leaves])
+            } : null
         };
     }
 
-    // ------------------------------------------
-    // I. GENERAL HR ANALYTICS
-    // e.g., "Give me an overview of HR metrics"
-    // ------------------------------------------
-    if (/(?:overview|analytics|metrics|dashboard|summary|stats)/i.test(lower)) {
-        const analytics = await db_fns.getHrAnalytics();
+    if (result.wfh_summary !== undefined) {
+        const summary = result.wfh_summary;
+        session.context.lastResultType = "wfh";
+        session.context.lastTopic = "wfh";
+        const topRequester = summary.top_employees[0]
+            ? `${summary.top_employees[0].employee_name} (${summary.top_employees[0].total_requests})`
+            : "None";
         return {
-            message: `Here is the current HR management overview:`,
+            message: `WFH summary: **${summary.total_records} request(s)** from **${summary.unique_employees} employee(s)**.`,
             structuredData: {
                 type: "metrics",
-                title: "HR System Overview",
+                title: "WFH Summary",
                 metrics: [
-                    { label: "Active Employees", value: analytics.active_employees },
-                    { label: "Total Leave Records", value: analytics.total_leave_records },
-                    { label: "Total Leave Days", value: analytics.total_leave_days },
-                    { label: "Total WFH Requests", value: analytics.total_wfh_requests }
+                    { label: "Total Requests", value: summary.total_records },
+                    { label: "Unique Employees", value: summary.unique_employees },
+                    { label: "Top Requester", value: topRequester }
                 ]
             }
         };
     }
 
-    // ------------------------------------------
-    // J. FALLBACK / SUGGESTION
-    // ------------------------------------------
+    if (result.wfh_records !== undefined) {
+        const records = result.wfh_records;
+        session.context.lastResultType = "wfh";
+        return {
+            message: `Found **${records.length} WFH record(s)**${toolParams.employee_name ? ` for **${toolParams.employee_name}**` : ""}:`,
+            structuredData: records.length ? {
+                type: "table",
+                title: `WFH Records${toolParams.employee_name ? ` — ${toolParams.employee_name}` : ""}`,
+                columns: ["ID", "Employee", "Date", "Reason"],
+                rows: records.map(r => [r.id, r.employee_name, String(r.wfh_date).slice(0, 10), r.reason || "N/A"])
+            } : null
+        };
+    }
+
+    if (result.hr_analytics !== undefined) {
+        const a = result.hr_analytics;
+        return {
+            message: "Here is the current HR overview:",
+            structuredData: {
+                type: "metrics",
+                title: "HR Analytics Overview",
+                metrics: [
+                    { label: "Total Employees", value: a.total_employees },
+                    { label: "Active Employees", value: a.active_employees },
+                    { label: "Total Leave Records", value: a.total_leave_records },
+                    { label: "Total Leave Days", value: a.total_leave_days },
+                    { label: "Total WFH Requests", value: a.total_wfh_requests }
+                ]
+            }
+        };
+    }
+
+    return { message: "Operation completed." };
+};
+
+// ============================================================
+// WRITE PROPOSAL BUILDER
+// ============================================================
+
+const buildWriteProposal = async (toolName, params) => {
+    switch (toolName) {
+        case "create_leave":
+            return {
+                id: `act_${Date.now()}`,
+                type: "CREATE_LEAVE",
+                tool: "create_leave",
+                params,
+                title: "Create Leave Request",
+                summary: `Create ${params.leave_type === "HALF_DAY" ? "half-day" : "full-day"} leave for **${params.employee_name}** on ${params.leave_date}`,
+                details: { Employee: params.employee_name, Date: params.leave_date, Type: params.leave_type || "FULL_DAY", Days: params.no_of_leaves || 1 }
+            };
+        case "create_leave_range":
+            return {
+                id: `act_${Date.now()}`,
+                type: "CREATE_LEAVE",
+                tool: "create_leave_range",
+                params,
+                title: "Create Leave Request",
+                summary: `Create leave for **${params.employee_name}** from ${params.startDate} to ${params.endDate}`,
+                details: { Employee: params.employee_name, "Start Date": params.startDate, "End Date": params.endDate, Type: params.leave_type || "FULL_DAY" }
+            };
+        case "create_wfh":
+            return {
+                id: `act_${Date.now()}`,
+                type: "CREATE_WFH",
+                tool: "create_wfh",
+                params,
+                title: "Create WFH Request",
+                summary: `Create WFH for **${params.employee_name}** on ${params.wfh_date}`,
+                details: { Employee: params.employee_name, Date: params.wfh_date, Reason: params.reason || "Remote work" }
+            };
+        case "create_employee":
+            return {
+                id: `act_${Date.now()}`,
+                type: "CREATE_EMPLOYEE",
+                tool: "create_employee",
+                params: { ...params, is_active: true },
+                title: "Add New Employee",
+                summary: `Add **${params.name}** to the **${params.department}** department`,
+                details: { Name: params.name, Department: params.department, Status: "Active" }
+            };
+        case "update_employee": {
+            const emp = await db_fns.getById(params.id).catch(() => null);
+            return {
+                id: `act_${Date.now()}`,
+                type: "UPDATE_EMPLOYEE",
+                tool: "update_employee",
+                params,
+                title: "Update Employee",
+                summary: `Update employee${emp ? ` **${emp.name}**` : ` ID ${params.id}`}`,
+                details: {
+                    "Employee ID": params.id,
+                    ...(emp ? { Name: emp.name, "Current Dept": emp.department } : {}),
+                    ...(params.department ? { "New Department": params.department } : {}),
+                    ...(params.is_active !== undefined ? { "New Status": params.is_active ? "Active" : "Inactive" } : {})
+                }
+            };
+        }
+        case "delete_employee": {
+            const emp = await db_fns.getById(params.id).catch(() => null);
+            return {
+                id: `act_${Date.now()}`,
+                type: "DELETE_EMPLOYEE",
+                tool: "delete_employee",
+                params: { ...params, soft: true },
+                title: "Deactivate Employee",
+                summary: `Deactivate employee${emp ? ` **${emp.name}**` : ` ID ${params.id}`}`,
+                details: { "Employee ID": params.id, ...(emp ? { Name: emp.name, Department: emp.department } : {}), Action: "Soft deactivate" },
+                warning: "This will mark the employee as inactive. All associated records are preserved."
+            };
+        }
+        default:
+            return null;
+    }
+};
+
+// ============================================================
+// LLM CALL (with model fallback chain for 503 high-demand errors)
+// ============================================================
+
+const FALLBACK_MODELS = [
+    "gemini-3-flash-preview",
+    "gemini-3.8-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-flash-latest",
+];
+
+const callLLM = async (session, userMessage) => {
+    if (!genAI) return null;
+
+    const systemInstruction = buildSystemPrompt(session.context);
+    const toolDeclarations = TOOL_SCHEMAS.map(t => ({
+        name: t.name,
+        description: t.description,
+        parameters: t.parameters
+    }));
+
+    const historyForLLM = session.history.slice(-14).map(h => ({
+        role: h.role === "assistant" ? "model" : "user",
+        parts: [{ text: h.content }]
+    }));
+
+    const modelsToTry = [GEMINI_MODEL, ...FALLBACK_MODELS.filter(m => m !== GEMINI_MODEL)];
+
+    for (const model of modelsToTry) {
+        try {
+            const chat = genAI.chats.create({
+                model,
+                config: {
+                    systemInstruction,
+                    tools: [{ functionDeclarations: toolDeclarations }],
+                    toolConfig: { functionCallingConfig: { mode: "AUTO" } },
+                    temperature: 0.1,
+                },
+                history: historyForLLM
+            });
+
+            const response = await chat.sendMessage({ message: userMessage });
+            const candidate = response.candidates?.[0];
+            if (!candidate) continue;
+
+            const functionCalls = [];
+            let textResponse = null;
+
+            for (const part of candidate.content?.parts || []) {
+                if (part.functionCall) {
+                    functionCalls.push({ name: part.functionCall.name, args: part.functionCall.args || {} });
+                } else if (part.text) {
+                    textResponse = part.text;
+                }
+            }
+
+            if (model !== GEMINI_MODEL) {
+                console.log(`[LLM] Using fallback model: ${model}`);
+            }
+            return { functionCalls, textResponse };
+
+        } catch (err) {
+            const is503 = err.message && (err.message.includes("503") || err.message.includes("high demand") || err.message.includes("UNAVAILABLE"));
+            const is404 = err.message && (err.message.includes("404") || err.message.includes("not found") || err.message.includes("no longer available"));
+
+            if (is503 || is404) {
+                console.warn(`[LLM] Model ${model} unavailable (${is503 ? "503" : "404"}), trying next...`);
+                continue;
+            }
+
+            console.error("[LLM] Gemini error:", err.message);
+            return null;
+        }
+    }
+
+    console.error("[LLM] All models unavailable — falling back to rule-based engine.");
+    return null;
+};
+
+// ============================================================
+// RULE-BASED FALLBACK (no API key mode)
+// ============================================================
+
+const ruleBasedFallback = async (text, session) => {
+    const lower = text.toLowerCase();
+    const timeframe = parseTimeframe(text) || session.context.activeTimeframe;
+    if (timeframe) session.context.activeTimeframe = timeframe;
+
+    const deptMatch = text.match(/(?:in|from|for|of)\s+(?:the\s+)?([A-Za-z][A-Za-z0-9\s&]+?)(?:\s+department|\s+team|$)/i);
+    let dept = deptMatch ? deptMatch[1].trim() : null;
+    if (!dept && /them|those|same|among/i.test(lower)) dept = session.context.activeDepartment;
+
+    if (/(?:list|show|who|find|get|display)\s+.*employee|employee/i.test(lower) && !/leave|wfh/i.test(lower)) {
+        if (dept) {
+            const emps = await db_fns.getAllEmployees({ department: dept });
+            return formatToolResult("search_employees", { department: dept }, { employees: emps }, session);
+        }
+        const emps = await db_fns.getAllEmployees({ limit: 50 });
+        return formatToolResult("search_employees", {}, { employees: emps }, session);
+    }
+
+    if (/leave/i.test(lower) && !/create|add|apply|book/i.test(lower)) {
+        const useGroup = /them|those|among/i.test(lower) && session.context.employeeGroup;
+        if (/most|highest|top/i.test(lower)) {
+            const summary = await db_fns.getLeaveSummary({ startDate: timeframe?.startDate, endDate: timeframe?.endDate });
+            let top = summary.top_employees;
+            if (useGroup) top = top.filter(e => session.context.employeeGroup.includes(e.employee_name));
+            return formatToolResult("get_leave_summary", { startDate: timeframe?.startDate, endDate: timeframe?.endDate }, { leave_summary: { ...summary, top_employees: top } }, session);
+        }
+        const summary = await db_fns.getLeaveSummary({ startDate: timeframe?.startDate, endDate: timeframe?.endDate });
+        return formatToolResult("get_leave_summary", { startDate: timeframe?.startDate, endDate: timeframe?.endDate }, { leave_summary: summary }, session);
+    }
+
+    if (/wfh|work.from.home/i.test(lower) && !/create|add|apply/i.test(lower)) {
+        const summary = await db_fns.getWfhSummary({ startDate: timeframe?.startDate, endDate: timeframe?.endDate });
+        return formatToolResult("get_wfh_summary", {}, { wfh_summary: summary }, session);
+    }
+
+    if (/overview|analytics|metrics|dashboard|summary/i.test(lower)) {
+        const analytics = await db_fns.getHrAnalytics();
+        return formatToolResult("get_hr_analytics", {}, { hr_analytics: analytics }, session);
+    }
+
     return {
-        message: `I didn't quite catch the specific HR operation. You can ask me to:
-• **"Show me all employees in the Engineering department"**
-• **"Create leaves for [Name] from [Date] to [Date]"**
-• **"How many leaves has [Name] taken in the last three months?"**
-• **"Give me the total number of work-from-home requests this month"**
-• **"Update [Name]'s department to [New Department]"**
-• **"Delete employee ID [ID]"**`,
+        message: `To enable full natural language understanding, add your **Gemini API key** to \`backend/.env\`:\n\`\`\`\nGEMINI_API_KEY=your-key-here\n\`\`\`\nGet a free key at **aistudio.google.com/apikey**\n\nIn the meantime, try:\n• **"Show employees in Engineering"**\n• **"Who took the most leaves this year?"**\n• **"Show WFH summary this month"**\n• **"Give me the HR overview"**`,
         suggestedPrompts: [
-            "Show me all employees in the SDE department",
-            "Give me the total number of work-from-home requests this month",
-            "How many active employees do we have?",
-            "Show me the employees who have applied for the most leaves this year"
+            "Show me all employees in Engineering",
+            "Who took the most leaves this year?",
+            "Give me the HR overview",
+            "Show WFH summary this month"
         ]
     };
+};
+
+// ============================================================
+// EMPLOYEE NAME EXTRACTION HELPER
+// ============================================================
+
+const extractEmployeeNameFromText = async (text, context) => {
+    if (/all\s+employees|everyone/i.test(text)) return null;
+
+    const idMatch = text.match(/(?:employee\s+id|id)\s*[:#]?\s*(\d+)/i);
+    if (idMatch) {
+        const emp = await db_fns.getById(idMatch[1]);
+        if (emp) return emp.name;
+    }
+
+    const allEmployees = await db_fns.getAllEmployees();
+    for (const emp of allEmployees) {
+        if (new RegExp(`\\b${emp.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, "i").test(text)) return emp.name;
+    }
+
+    const nameMatch = text.match(/(?:for|named?|about|change|update|delete|remove)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i);
+    if (nameMatch) return nameMatch[1].trim();
+
+    if (context?.activeEmployee && /he|she|they|him|her|same|this\s+employee/i.test(text)) {
+        return context.activeEmployee;
+    }
+
+    return null;
+};
+
+// ============================================================
+// MAIN ENTRY POINT
+// ============================================================
+
+const processMessage = async ({ message, sessionId = "default", confirmationAction = null }) => {
+    const session = getSession(sessionId);
+    const text = (message || "").trim();
+
+    // ─────────────────────────────────────────
+    // 1. CONFIRMATION WORKFLOW
+    // ─────────────────────────────────────────
+
+    if (confirmationAction) {
+        const { actionId, confirmed } = confirmationAction;
+        const proposal = session.pendingProposal;
+
+        if (!proposal || proposal.id !== actionId) {
+            return { message: "No matching pending action found or it has expired.", status: "EXPIRED" };
+        }
+
+        session.pendingProposal = null;
+
+        if (!confirmed) {
+            return { message: `Action cancelled: ${proposal.summary}. No changes were made.`, status: "CANCELLED", actionProposal: null };
+        }
+
+        try {
+            const toolFn = tools[proposal.tool];
+            if (!toolFn) throw new Error(`Unknown tool: ${proposal.tool}`);
+            const result = await toolFn(proposal.params);
+            session.history.push({ role: "assistant", content: `Executed: ${proposal.summary}` });
+            return {
+                message: `✅ **Successfully executed**: ${proposal.summary}`,
+                status: "COMPLETED",
+                actionResult: { type: proposal.type, data: result },
+                structuredData: { type: "card", title: "Operation Completed", data: result }
+            };
+        } catch (err) {
+            console.error("[Agent] Confirmed action error:", err);
+            return { message: `❌ Failed to execute: ${err.message}`, status: "FAILED", error: err.message };
+        }
+    }
+
+    // Text-based confirmation
+    if (session.pendingProposal) {
+        const isConfirm = /\b(yes|confirm|proceed|ok|okay|sure|go ahead|do it|execute|agree|accepted)\b/i.test(text);
+        const isCancel = /\b(no|cancel|abort|stop|don't|dont|nevermind|reject)\b/i.test(text);
+
+        if (isConfirm && !isCancel) {
+            return processMessage({ sessionId, confirmationAction: { actionId: session.pendingProposal.id, confirmed: true } });
+        } else if (isCancel) {
+            return processMessage({ sessionId, confirmationAction: { actionId: session.pendingProposal.id, confirmed: false } });
+        }
+    }
+
+    // ─────────────────────────────────────────
+    // 2. FAST PATH: CLEAR WRITE INTENTS (for reliable UX without LLM)
+    // ─────────────────────────────────────────
+
+    const lower = text.toLowerCase();
+
+    if (/(?:create|apply|add|book|request)\s+(?:a\s+)?leave/i.test(lower)) {
+        const tf = parseTimeframe(text);
+        const nameMatch = await extractEmployeeNameFromText(text, session.context);
+
+        if (!nameMatch) return { message: "Which employee should I create the leave for?", needsClarification: true };
+        if (!tf) return { message: `What date(s) should the leave be for **${nameMatch}**?`, needsClarification: true };
+
+        const isHalf = /half.?day/i.test(text);
+        const startDate = tf.startDate || tf.date;
+        const endDate = tf.endDate || tf.date;
+
+        const proposal = await buildWriteProposal(
+            startDate === endDate ? "create_leave" : "create_leave_range",
+            startDate === endDate
+                ? { employee_name: nameMatch, leave_date: startDate, leave_type: isHalf ? "HALF_DAY" : "FULL_DAY", no_of_leaves: isHalf ? 0.5 : 1 }
+                : { employee_name: nameMatch, startDate, endDate, leave_type: isHalf ? "HALF_DAY" : "FULL_DAY" }
+        );
+
+        session.pendingProposal = proposal;
+        session.history.push({ role: "user", content: text });
+        return { message: `I've prepared the leave request for **${nameMatch}**. Please review and confirm:`, requiresConfirmation: true, actionProposal: proposal };
+    }
+
+    if (/(?:create|apply|add|request)\s+(?:a\s+)?(?:wfh|work.from.home)/i.test(lower)) {
+        const tf = parseTimeframe(text);
+        const nameMatch = await extractEmployeeNameFromText(text, session.context);
+
+        if (!nameMatch) return { message: "Which employee should I create the WFH request for?", needsClarification: true };
+        const wfhDate = tf?.date || tf?.startDate;
+        if (!wfhDate) return { message: `What date should the WFH be for **${nameMatch}**?`, needsClarification: true };
+
+        const proposal = await buildWriteProposal("create_wfh", { employee_name: nameMatch, wfh_date: wfhDate, reason: "Remote work" });
+        session.pendingProposal = proposal;
+        session.history.push({ role: "user", content: text });
+        return { message: `I've prepared the WFH request for **${nameMatch}**. Please review and confirm:`, requiresConfirmation: true, actionProposal: proposal };
+    }
+
+    if (/(?:create|add|register|hire)\s+(?:a\s+)?(?:new\s+)?employee/i.test(lower)) {
+        const nameMatch = text.match(/(?:named?|called)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i);
+        const deptMatch = text.match(/(?:in|to)\s+(?:the\s+)?([A-Za-z][A-Za-z0-9\s&]+?)(?:\s+department|$)/i);
+        const name = nameMatch ? nameMatch[1] : null;
+        const dept = deptMatch ? deptMatch[1].trim() : null;
+
+        if (!name) return { message: "What is the name of the new employee? (e.g. 'Create employee named Rohit in Engineering')", needsClarification: true };
+        if (!dept) return { message: `Which department should **${name}** be assigned to?`, needsClarification: true };
+
+        const proposal = await buildWriteProposal("create_employee", { name, department: dept });
+        session.pendingProposal = proposal;
+        session.history.push({ role: "user", content: text });
+        return { message: `I've prepared the registration for **${name}**. Please review and confirm:`, requiresConfirmation: true, actionProposal: proposal };
+    }
+
+    // ─────────────────────────────────────────
+    // 3. LLM REASONING LAYER
+    // ─────────────────────────────────────────
+
+    session.history.push({ role: "user", content: text });
+
+    const llmResult = await callLLM(session, text);
+
+    if (llmResult) {
+        const { functionCalls, textResponse } = llmResult;
+
+        // LLM responded with plain text (no tool calls)
+        if (!functionCalls || functionCalls.length === 0) {
+            if (textResponse) {
+                session.history.push({ role: "assistant", content: textResponse });
+                return { message: textResponse };
+            }
+        }
+
+        // Process tool calls
+        const responses = [];
+        for (const fc of functionCalls) {
+            try {
+                const rawResult = await executeTool(fc.name, fc.args, session);
+
+                if (rawResult?.__clarification) {
+                    session.history.push({ role: "assistant", content: rawResult.__clarification });
+                    return { message: rawResult.__clarification, needsClarification: true };
+                }
+
+                if (rawResult?.__proposal) {
+                    const proposal = await buildWriteProposal(rawResult.__proposal.tool, rawResult.__proposal.params);
+                    if (proposal) {
+                        session.pendingProposal = proposal;
+                        session.history.push({ role: "assistant", content: `Proposed: ${proposal.summary}` });
+                        return {
+                            message: `I've prepared the following action. Please review and confirm:`,
+                            requiresConfirmation: true,
+                            actionProposal: proposal
+                        };
+                    }
+                }
+
+                const formatted = formatToolResult(fc.name, fc.args, rawResult, session);
+                responses.push(formatted);
+            } catch (err) {
+                console.error(`[Agent] Tool error (${fc.name}):`, err.message);
+                responses.push({ message: `⚠️ Error running ${fc.name}: ${err.message}` });
+            }
+        }
+
+        if (responses.length === 1) {
+            session.history.push({ role: "assistant", content: responses[0].message });
+            return responses[0];
+        }
+
+        if (responses.length > 1) {
+            const combined = {
+                message: responses.map(r => r.message).join("\n\n"),
+                structuredData: responses.find(r => r.structuredData)?.structuredData
+            };
+            session.history.push({ role: "assistant", content: combined.message });
+            return combined;
+        }
+
+        if (textResponse) {
+            session.history.push({ role: "assistant", content: textResponse });
+            return { message: textResponse };
+        }
+    }
+
+    // ─────────────────────────────────────────
+    // 4. RULE-BASED FALLBACK
+    // ─────────────────────────────────────────
+
+    const fallbackResult = await ruleBasedFallback(text, session);
+    session.history.push({ role: "assistant", content: fallbackResult.message });
+    return fallbackResult;
 };
 
 module.exports = { processMessage, getSession };
