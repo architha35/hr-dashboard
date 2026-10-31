@@ -9,17 +9,18 @@ const app = express();
 
 app.use(express.json());
 
-app.use(cors({
-    origin: [
+const allowedOrigins = [
         "http://localhost:5173",
         "http://localhost:5174",
         "http://localhost:5176",
         "http://localhost:5177",
         "http://localhost:5178",
         "http://localhost:3000",
-        "https://hr-dashboard-2-65et.onrender.com"
-    ]
-}));
+        "https://hr-dashboard-2-65et.onrender.com",
+        ...(process.env.FRONTEND_URL ? [process.env.FRONTEND_URL] : [])
+];
+
+app.use(cors({ origin: allowedOrigins }));
 
 app.get("/api/test", async (req,res ) => {
   return res.send("working!");

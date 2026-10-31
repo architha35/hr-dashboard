@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: hr-dashboard-api
+    runtime: node
+    rootDir: backend
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/test
+    plan: free
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FRONTEND_URL
+        value: https://hr-dashboard-frontend.onrender.com
+
+  - type: static
+    name: hr-dashboard-frontend
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    plan: free
+    envVars:
+      - key: VITE_API_URL
+        fromService:
+          type: web
+          name: hr-dashboard-api
+          envVarKey: RENDER_EXTERNAL_URL

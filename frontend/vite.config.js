@@ -6,9 +6,8 @@ export default defineConfig({
   server: {
     proxy: {
       "/api": {
-        target: "https://hr-dashboard-5.onrender.com",
+        target: "http://localhost:4000",
         changeOrigin: true,
-        secure: true,
       },
     },
   },
